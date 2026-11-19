@@ -1,14 +1,19 @@
 """
-Backtest della strategia definita in strategy.py (Supertrend + filtro EMA 50/100, BTCUSDT 15m).
+Backtest della strategia definita in strategy.py (Supertrend + filtro EMA 50/100, timeframe 15m).
 
 Questo file contiene tutto ciò che NON è logica di trading: caricamento e controllo dei
-dati 1m Binance, aggregazione a 15m, replay candela per candela (come un loop live),
+dati 1m, aggregazione a 15m, replay candela per candela (come un loop live),
 simulazione dell'esecuzione con costi, metriche, grafici, report e salvataggio.
 Le regole di trading stanno solo in strategy.py e qui vengono usate senza duplicarle.
 
+Formati di dati supportati (rilevati automaticamente dal contenuto del file):
+- HistData.com "DAT_ASCII" M1 (es. XAUUSD): "YYYYMMDD HHMMSS;open;high;low;close;volume",
+  orari in EST fisso (UTC-5, senza ora legale), convertiti in UTC;
+- Binance klines 1m (12 colonne, timestamp in ms o µs).
+
 Uso:
     python backtest.py
-    python backtest.py --data-dir "C:\\Users\\Admin\\Downloads\\dati backtest" --name BTCUSDT_1m_2023-2024 --out output
+    python backtest.py --data-dir "C:\\Users\\Admin\\Downloads\\dati" --name XAUUSD_M1_2023_2024 --out output
 """
 
 from __future__ import annotations
@@ -20,8 +25,8 @@ import math
 import os
 import re
 import sys
+import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -32,8 +37,8 @@ import strategy as st
 # ---------------------------------------------------------------------------
 # Configurazione del backtest (non sono parametri della strategia)
 # ---------------------------------------------------------------------------
-DEFAULT_DATA_DIR = r"C:\Users\Admin\Downloads\dati backtest"
-DEFAULT_NAME = "BTCUSDT_1m_2023-2024"
+DEFAULT_DATA_DIR = r"C:\Users\Admin\Downloads\dati"
+DEFAULT_NAME = "XAUUSD_M1_2023_2024"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "output")
 
@@ -43,6 +48,14 @@ SLIPPAGE_RATE = 0.0002        # 0.02% per lato, applicato in modo avverso al pre
 MAX_ALLOWED_TIME = pd.Timestamp("2025-12-31 23:59:59.999999", tz="UTC")
 LARGE_GAP_MINUTES = 60        # buchi da riportare nel report
 MIN_TRADES_SAMPLE = 200
+
+# HistData.com: gli orari dei file ASCII sono in EST fisso (UTC-5) tutto l'anno
+HISTDATA_UTC_OFFSET_HOURS = 5
+HISTDATA_LINE = re.compile(r"^\s*\d{8} \d{6};")
+MARKET_TZ = "America/New_York"   # usato solo per classificare le chiusure di mercato
+
+FORMAT_HISTDATA = "histdata"
+FORMAT_BINANCE = "binance"
 
 KLINE_COLUMNS = [
     "open_time", "open", "high", "low", "close", "volume", "close_time",
@@ -58,6 +71,10 @@ SESSIONS = {
     "Londra": [(8, 13)],           # 08:00-12:59 UTC
     "NY": [(13, 21)],              # 13:00-20:59 UTC
 }
+
+GAP_WEEKEND = "chiusura_weekend"
+GAP_DAILY = "pausa_giornaliera"
+GAP_OTHER = "altro"
 
 log = logging.getLogger("backtest")
 
@@ -86,8 +103,9 @@ def setup_logging(out_dir: str) -> str:
 # ---------------------------------------------------------------------------
 def find_data_files(data_dir: str, name: str) -> List[str]:
     """
-    Cerca prima un file unico `name`.(csv|parquet|zip|...); in mancanza, i file
-    mensili BTCUSDT-1m-YYYY-MM(.csv|.zip) ordinati cronologicamente.
+    Cerca prima un file unico `name`.(csv|txt|parquet|zip); in mancanza, i file annuali
+    HistData DAT_ASCII_<SIMBOLO>_M1_YYYY.(csv|zip) oppure i file mensili Binance
+    BTCUSDT-1m-YYYY-MM.(csv|zip), ordinati cronologicamente.
     """
     if not os.path.isdir(data_dir):
         raise FileNotFoundError(f"Cartella dati non trovata: {data_dir}")
@@ -97,33 +115,105 @@ def find_data_files(data_dir: str, name: str) -> List[str]:
         if os.path.isfile(path) and re.fullmatch(re.escape(name) + r"(\.[A-Za-z0-9]+)+", base):
             single.append(path)
     if single:
-        # preferenza: parquet > csv > zip > altro
-        order = {".parquet": 0, ".csv": 1, ".zip": 2}
+        # preferenza: parquet > csv > zip > txt
+        order = {".parquet": 0, ".csv": 1, ".zip": 2, ".txt": 3}
         single.sort(key=lambda p: order.get(os.path.splitext(p)[1].lower(), 9))
         log.info("File unico trovato: %s (candidati: %s)", single[0], [os.path.basename(p) for p in single])
         return [single[0]]
-    pattern = re.compile(r"BTCUSDT-1m-(\d{4})-(\d{2})\.(csv|zip)$", re.IGNORECASE)
-    monthly: Dict[Tuple[int, int], str] = {}
-    for path in glob.glob(os.path.join(data_dir, "*")):
-        m = pattern.search(os.path.basename(path))
-        if not m:
-            continue
-        key = (int(m.group(1)), int(m.group(2)))
-        # se esistono sia .csv sia .zip dello stesso mese si preferisce il .csv
-        if key not in monthly or path.lower().endswith(".csv"):
-            monthly[key] = path
-    if not monthly:
-        raise FileNotFoundError(
-            f"Nessun file '{name}.*' né file mensili 'BTCUSDT-1m-YYYY-MM.(csv|zip)' in {data_dir}"
-        )
-    files = [monthly[k] for k in sorted(monthly)]
-    log.info("File unico non trovato: uso %d file mensili (%s ... %s)", len(files),
-             os.path.basename(files[0]), os.path.basename(files[-1]))
-    return files
+    patterns = [
+        ("annuali HistData", re.compile(r"DAT_ASCII_[A-Z0-9]+_M1_(\d{4})(\d{2})?\.(csv|zip)$", re.IGNORECASE)),
+        ("mensili Binance", re.compile(r"BTCUSDT-1m-(\d{4})-(\d{2})\.(csv|zip)$", re.IGNORECASE)),
+    ]
+    for label, pattern in patterns:
+        found: Dict[Tuple[int, int], str] = {}
+        for path in glob.glob(os.path.join(data_dir, "*")):
+            m = pattern.search(os.path.basename(path))
+            if not m:
+                continue
+            key = (int(m.group(1)), int(m.group(2) or 0))
+            # se esistono sia .csv sia .zip dello stesso periodo si preferisce il .csv
+            if key not in found or path.lower().endswith(".csv"):
+                found[key] = path
+        if found:
+            files = [found[k] for k in sorted(found)]
+            log.info("File unico '%s' non trovato: uso %d file %s (%s ... %s)", name, len(files), label,
+                     os.path.basename(files[0]), os.path.basename(files[-1]))
+            return files
+    raise FileNotFoundError(
+        f"Nessun file '{name}.*', né file annuali HistData, né file mensili Binance in {data_dir}. "
+        f"File presenti: {sorted(os.listdir(data_dir))}"
+    )
 
 
-def read_one_file(path: str) -> pd.DataFrame:
-    """Legge un file klines (csv, zip con csv, parquet) come tabella grezza di stringhe/valori."""
+def _first_lines(path: str, n: int = 5) -> List[str]:
+    """Prime righe non vuote di un file di testo (anche dentro uno zip)."""
+    if path.lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            member = [x for x in z.namelist() if not x.endswith("/")][0]
+            with z.open(member) as f:
+                raw = f.read(4096).decode("utf-8", errors="replace")
+    else:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(4096)
+    return [x for x in raw.splitlines() if x.strip()][:n]
+
+
+def detect_format(path: str) -> str:
+    """Rileva il formato dal contenuto del file, non dal nome."""
+    if path.lower().endswith(".parquet"):
+        return FORMAT_BINANCE
+    lines = _first_lines(path)
+    if any(HISTDATA_LINE.match(x) for x in lines):
+        return FORMAT_HISTDATA
+    return FORMAT_BINANCE
+
+
+def detect_symbol(files: List[str]) -> str:
+    """Simbolo dedotto dal nome del file (solo per etichette e report)."""
+    for f in files:
+        m = re.search(r"(XAUUSD|XAGUSD|BTCUSDT|BTCUSD|[A-Z]{6})", os.path.basename(f).upper())
+        if m:
+            return m.group(1)
+    return "SCONOSCIUTO"
+
+
+def read_histdata(path: str, info: Dict) -> pd.DataFrame:
+    """
+    Legge un file HistData ASCII M1: "YYYYMMDD HHMMSS;open;high;low;close;volume".
+    Gli orari sono EST fisso (UTC-5, senza ora legale) e vengono convertiti in UTC.
+    """
+    raw = pd.read_csv(path, sep=";", header=None, dtype=str, compression="infer")
+    ncol = raw.shape[1]
+    if ncol < 5:
+        raise ValueError(f"{path}: solo {ncol} colonne, attese 6 (data;open;high;low;close;volume)")
+    if ncol != 6:
+        log.warning("%s: %d colonne invece delle 6 attese; uso le prime 5/6", path, ncol)
+    dt = raw.iloc[:, 0].astype(str).str.strip()
+    ok = dt.str.fullmatch(r"\d{8} \d{6}")
+    n_bad = int((~ok).sum())
+    if n_bad:
+        log.info("%s: scartate %d righe non conformi (intestazioni/righe spurie), es. %s",
+                 os.path.basename(path), n_bad, dt[~ok].unique()[:3].tolist())
+    info["header_rows"] += n_bad
+    raw = raw[ok]
+    dt = dt[ok]
+    local = pd.to_datetime(dt, format="%Y%m%d %H%M%S")
+    utc = (local + pd.Timedelta(hours=HISTDATA_UTC_OFFSET_HOURS)).dt.tz_localize("UTC").dt.as_unit("ns")
+    info["files"].append({"file": os.path.basename(path), "rows": len(raw), "columns": ncol})
+    return pd.DataFrame({
+        "time_ns": utc.astype("int64").to_numpy(),
+        "open": pd.to_numeric(raw.iloc[:, 1], errors="coerce").to_numpy(),
+        "high": pd.to_numeric(raw.iloc[:, 2], errors="coerce").to_numpy(),
+        "low": pd.to_numeric(raw.iloc[:, 3], errors="coerce").to_numpy(),
+        "close": pd.to_numeric(raw.iloc[:, 4], errors="coerce").to_numpy(),
+        "volume": (pd.to_numeric(raw.iloc[:, 5], errors="coerce").to_numpy() if ncol >= 6
+                   else np.zeros(len(raw))),
+        "source_file": os.path.basename(path),
+    })
+
+
+def read_binance_raw(path: str) -> pd.DataFrame:
+    """Legge un file klines Binance (csv, zip con csv, parquet) come tabella grezza."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
         df = pd.read_parquet(path)
@@ -140,57 +230,87 @@ def read_one_file(path: str) -> pd.DataFrame:
             df = df.iloc[:, : min(12, df.shape[1])]
             df.columns = KLINE_COLUMNS[: df.shape[1]]
         return df.astype(str)
-    df = pd.read_csv(path, header=None, dtype=str, compression="infer")
-    return df
+    return pd.read_csv(path, header=None, dtype=str, compression="infer")
+
+
+def read_binance(path: str, info: Dict) -> pd.DataFrame:
+    """
+    Klines Binance: gestisce intestazioni assenti o ripetute, verifica le colonne e converte
+    i timestamp (ms o µs, rilevati dal numero di cifre) in UTC.
+    """
+    raw = read_binance_raw(path)
+    ncol = raw.shape[1]
+    if ncol < 6:
+        raise ValueError(f"{path}: solo {ncol} colonne, ne servono almeno 6 (attese 12)")
+    if ncol != 12:
+        log.warning("%s: %d colonne invece delle 12 attese; uso le prime 6 (OHLCV)", path, ncol)
+    raw = raw.iloc[:, : min(ncol, 12)].copy()
+    raw.columns = KLINE_COLUMNS[: raw.shape[1]]
+    first = raw["open_time"].astype(str).str.strip()
+    is_num = first.str.fullmatch(r"\d+(\.0+)?")
+    n_header = int((~is_num).sum())
+    if n_header:
+        log.info("%s: scartate %d righe non numeriche (intestazioni/righe spurie), es. %s",
+                 os.path.basename(path), n_header, first[~is_num].unique()[:3].tolist())
+    info["header_rows"] += n_header
+    raw = raw[is_num]
+    info["files"].append({"file": os.path.basename(path), "rows": len(raw), "columns": ncol})
+    ot_int = pd.to_numeric(raw["open_time"], errors="coerce").astype("float64").astype("int64").to_numpy()
+    digits = np.floor(np.log10(np.maximum(ot_int.astype("float64"), 1))) + 1
+    unit = np.where(digits >= 16, "us", np.where(digits >= 13, "ms", "s"))
+    for u, c in pd.Series(unit).value_counts().items():
+        info["unit_counts"][u] = info["unit_counts"].get(u, 0) + int(c)
+    ns = np.where(unit == "us", ot_int * 1_000, np.where(unit == "ms", ot_int * 1_000_000, ot_int * 1_000_000_000))
+    return pd.DataFrame({
+        "time_ns": ns.astype("int64"),
+        "open": pd.to_numeric(raw["open"], errors="coerce").to_numpy(),
+        "high": pd.to_numeric(raw["high"], errors="coerce").to_numpy(),
+        "low": pd.to_numeric(raw["low"], errors="coerce").to_numpy(),
+        "close": pd.to_numeric(raw["close"], errors="coerce").to_numpy(),
+        "volume": pd.to_numeric(raw["volume"], errors="coerce").to_numpy(),
+        "source_file": os.path.basename(path),
+    })
 
 
 def load_raw_klines(files: List[str]) -> Tuple[pd.DataFrame, Dict]:
-    """
-    Carica e unisce i file. Gestisce intestazioni assenti o ripetute (righe non
-    numeriche nella prima colonna), verifica il numero di colonne e converte i timestamp
-    (ms o µs, rilevati dal numero di cifre) in UTC.
-    """
-    info: Dict = {"files": [], "header_rows": 0, "unit_counts": {}}
+    """Carica e unisce i file (formato rilevato per ciascun file) in una tabella 1m in UTC."""
+    info: Dict = {"files": [], "header_rows": 0, "unit_counts": {}, "formats": set()}
     frames = []
     for path in files:
-        raw = read_one_file(path)
-        ncol = raw.shape[1]
-        if ncol < 6:
-            raise ValueError(f"{path}: solo {ncol} colonne, ne servono almeno 6 (attese 12)")
-        if ncol != 12:
-            log.warning("%s: %d colonne invece delle 12 attese; uso le prime 6 (OHLCV)", path, ncol)
-        raw = raw.iloc[:, : min(ncol, 12)].copy()
-        raw.columns = KLINE_COLUMNS[: raw.shape[1]]
-        first = raw["open_time"].astype(str).str.strip()
-        is_num = first.str.fullmatch(r"\d+(\.0+)?")
-        n_header = int((~is_num).sum())
-        if n_header:
-            examples = first[~is_num].unique()[:3].tolist()
-            log.info("%s: scartate %d righe non numeriche (intestazioni/righe spurie), es. %s",
-                     os.path.basename(path), n_header, examples)
-        info["header_rows"] += n_header
-        raw = raw[is_num]
-        raw["source_file"] = os.path.basename(path)
-        frames.append(raw)
-        info["files"].append({"file": os.path.basename(path), "rows": len(raw), "columns": ncol})
+        fmt_ = detect_format(path)
+        info["formats"].add(fmt_)
+        log.info("Formato di %s: %s", os.path.basename(path), fmt_)
+        if fmt_ == FORMAT_HISTDATA:
+            frames.append(read_histdata(path, info))
+            info["unit_counts"]["EST fisso (UTC-5) -> UTC"] = info["unit_counts"].get(
+                "EST fisso (UTC-5) -> UTC", 0) + len(frames[-1])
+        else:
+            frames.append(read_binance(path, info))
+    if len(info["formats"]) > 1:
+        raise ValueError(f"File con formati diversi: {info['formats']}")
+    info["format"] = info["formats"].pop()
+    info["symbol"] = detect_symbol(files)
     df = pd.concat(frames, ignore_index=True)
+    return df, info
 
-    ot = pd.to_numeric(df["open_time"], errors="coerce").astype("float64")
-    digits = np.floor(np.log10(np.maximum(ot.to_numpy(), 1))) + 1
-    unit = np.where(digits >= 16, "us", np.where(digits >= 13, "ms", "s"))
-    info["unit_counts"] = pd.Series(unit).value_counts().to_dict()
-    ot_int = pd.to_numeric(df["open_time"], errors="coerce").astype("int64").to_numpy()
-    ns = np.where(unit == "us", ot_int * 1_000, np.where(unit == "ms", ot_int * 1_000_000, ot_int * 1_000_000_000))
-    out = pd.DataFrame({
-        "time_ns": ns.astype("int64"),
-        "open": pd.to_numeric(df["open"], errors="coerce"),
-        "high": pd.to_numeric(df["high"], errors="coerce"),
-        "low": pd.to_numeric(df["low"], errors="coerce"),
-        "close": pd.to_numeric(df["close"], errors="coerce"),
-        "volume": pd.to_numeric(df["volume"], errors="coerce"),
-        "source_file": df["source_file"].to_numpy(),
-    })
-    return out, info
+
+def classify_gap(start: pd.Timestamp, end: pd.Timestamp, n_missing: int, data_format: str) -> str:
+    """
+    Classifica un buco come chiusura di mercato prevista o come buco "altro".
+    Solo per mercati non 24/7 (dati HistData, es. oro): orari di New York con ora legale.
+    - weekend: inizia venerdì/sabato e finisce domenica/lunedì/martedì (festività incluse), >= 24 ore;
+    - pausa giornaliera: inizia tra le 16:30 e le 18:00 di New York e dura al massimo 2 ore.
+    """
+    if data_format != FORMAT_HISTDATA:
+        return GAP_OTHER
+    s = start.tz_convert(MARKET_TZ)
+    e = end.tz_convert(MARKET_TZ)
+    if n_missing >= 24 * 60 and s.weekday() in (4, 5) and e.weekday() in (6, 0, 1):
+        return GAP_WEEKEND
+    minutes_of_day = s.hour * 60 + s.minute
+    if n_missing <= 120 and 16 * 60 + 30 <= minutes_of_day <= 18 * 60:
+        return GAP_DAILY
+    return GAP_OTHER
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +331,12 @@ class DataReport:
     non_positive_rows: int = 0
     ohlc_inconsistent_rows: int = 0
     zero_volume_rows: int = 0
-    gaps: List[Tuple[pd.Timestamp, pd.Timestamp, int]] = field(default_factory=list)
+    gaps: List[Tuple[pd.Timestamp, pd.Timestamp, int, str]] = field(default_factory=list)
     missing_minutes: int = 0
+    missing_minutes_by_type: Dict = field(default_factory=dict)
+    gaps_by_type: Dict = field(default_factory=dict)
+    data_format: str = FORMAT_BINANCE
+    symbol: str = "SCONOSCIUTO"
     first_time: Optional[pd.Timestamp] = None
     last_time: Optional[pd.Timestamp] = None
     rows_clean: int = 0
@@ -228,10 +352,12 @@ def ts(ns: int) -> pd.Timestamp:
 
 def check_and_clean(df: pd.DataFrame, info: Dict) -> Tuple[pd.DataFrame, DataReport]:
     """Esegue tutti i controlli obbligatori, documentandoli nel log, e restituisce dati puliti."""
-    rep = DataReport(rows_loaded=len(df), header_rows=info["header_rows"], unit_counts=info["unit_counts"])
+    rep = DataReport(rows_loaded=len(df), header_rows=info["header_rows"], unit_counts=info["unit_counts"],
+                     data_format=info.get("format", FORMAT_BINANCE), symbol=info.get("symbol", "SCONOSCIUTO"))
     log.info("=== CONTROLLI SUI DATI ===")
+    log.info("Formato: %s; simbolo: %s", rep.data_format, rep.symbol)
     log.info("Righe caricate: %d (righe di intestazione/spurie scartate: %d)", rep.rows_loaded, rep.header_rows)
-    log.info("Unità dei timestamp rilevate (numero di cifre): %s", rep.unit_counts)
+    log.info("Unità/fuso dei timestamp (convertiti in UTC): %s", rep.unit_counts)
 
     # NaN
     nan_mask = df[["open", "high", "low", "close", "volume"]].isna().any(axis=1)
@@ -306,6 +432,9 @@ def check_and_clean(df: pd.DataFrame, info: Dict) -> Tuple[pd.DataFrame, DataRep
     # Volume zero (tenute: sono minuti reali senza scambi)
     zero_vol = df["volume"] == 0
     rep.zero_volume_rows = int(zero_vol.sum())
+    if rep.zero_volume_rows == len(df):
+        log.info("Volume zero su TUTTE le righe: la fonte non fornisce volumi (tipico di HistData). "
+                 "Il volume non è usato dalla strategia.")
     log.info("Righe con volume zero: %d (mantenute, sono minuti esistenti senza scambi)%s",
              rep.zero_volume_rows,
              "" if not rep.zero_volume_rows else f", es. {[str(ts(x)) for x in df.loc[zero_vol, 'time_ns'].head(5)]}")
@@ -334,14 +463,21 @@ def check_and_clean(df: pd.DataFrame, info: Dict) -> Tuple[pd.DataFrame, DataRep
         start = ts(t[i] + MINUTE_NS)
         end = ts(t[i + 1] - MINUTE_NS)
         n_missing = int(d[i] // MINUTE_NS - 1)
-        rep.gaps.append((start, end, n_missing))
+        rep.gaps.append((start, end, n_missing, classify_gap(start, end, n_missing, rep.data_format)))
     rep.missing_minutes = int(sum(g[2] for g in rep.gaps))
+    for g in rep.gaps:
+        rep.gaps_by_type[g[3]] = rep.gaps_by_type.get(g[3], 0) + 1
+        rep.missing_minutes_by_type[g[3]] = rep.missing_minutes_by_type.get(g[3], 0) + g[2]
     rep.rows_clean = len(df)
     expected = int((t[-1] - t[0]) // MINUTE_NS + 1)
     log.info("Periodo coperto: %s -> %s; minuti attesi %d, presenti %d, mancanti %d in %d buchi",
              rep.first_time, rep.last_time, expected, rep.rows_clean, rep.missing_minutes, len(rep.gaps))
-    for start, end, n in rep.gaps:
-        log.info("  Buco: da %s a %s, %d minuti mancanti", start, end, n)
+    log.info("Buchi per tipo: %s; minuti mancanti per tipo: %s", rep.gaps_by_type, rep.missing_minutes_by_type)
+    if rep.data_format == FORMAT_HISTDATA:
+        log.info("Mercato non 24/7: chiusure del weekend e pausa giornaliera (17-18 New York) sono attese e non "
+                 "vengono riempite; le candele 15m interamente mancanti non sono alimentate alla strategia.")
+    for start, end, n, kind in rep.gaps:
+        log.info("  Buco: da %s a %s, %d minuti mancanti [%s]", start, end, n, kind)
     log.info("2025 presente nei dati: %s", "SÌ" if rep.has_2025 else "NO (il 2025 non è usato)")
     return df, rep
 
@@ -774,7 +910,7 @@ def breakdowns(res: ReplayResult) -> Dict[str, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 # Grafico
 # ---------------------------------------------------------------------------
-def plot_equity(res: ReplayResult, path: str) -> None:
+def plot_equity(res: ReplayResult, path: str, symbol: str = "") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -797,7 +933,7 @@ def plot_equity(res: ReplayResult, path: str) -> None:
             ax.spines[sp].set_visible(False)
         for sp in ("left", "bottom"):
             ax.spines[sp].set_color(grid)
-    fig.suptitle("Supertrend + EMA 50/100 - BTCUSDT 15m", x=0.01, ha="left", color=ink, fontsize=13)
+    fig.suptitle(f"Supertrend + EMA 50/100 - {symbol} 15m", x=0.01, ha="left", color=ink, fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -867,22 +1003,50 @@ def robustness(res: ReplayResult, m: Dict, m2: Dict, bd: Dict[str, pd.DataFrame]
     return notes
 
 
+def declarations(rep: DataReport) -> List[str]:
+    """Dichiarazioni obbligatorie, dipendenti dalla fonte dei dati."""
+    cost = (f"Costi: commissione {COMMISSION_RATE * 100:.2f}% per lato e slippage {SLIPPAGE_RATE * 100:.2f}% per lato "
+            "(applicato anche al TP).")
+    both = "Se nella stessa candela 1m sono toccati sia SL sia TP si assume lo **SL** (ipotesi conservativa)."
+    if rep.data_format == FORMAT_HISTDATA:
+        return [
+            f"1. Lo strumento è **{rep.symbol}** (oro contro dollaro USA per XAUUSD), dati M1 **HistData.com**: "
+            "una sola fonte, quotazioni **BID** di un feed FX/CFD, non un mercato regolamentato centralizzato.",
+            "2. Gli orari dei file HistData sono in **EST fisso (UTC-5, senza ora legale)** e sono stati convertiti in "
+            "UTC aggiungendo 5 ore.",
+            "3. Il mercato **non è 24/7**: chiusura nel weekend e pausa giornaliera (17-18 ora di New York). I buchi non "
+            "sono stati riempiti: le candele 15m mancanti non sono alimentate alla strategia e i trade aperti durante "
+            "una chiusura vengono verificati sulla prima 1m disponibile (uscita all'open se apre oltre SL o TP).",
+            "4. Su un CFD XAUUSD gli short sono possibili; **swap/finanziamento overnight non inclusi**.",
+            "5. Lo spread non è modellato esplicitamente (dati BID; gli acquisti in live avvengono all'ASK): lo slippage "
+            "lo approssima solo in parte. I prezzi possono differire da quelli del broker/CFD usato in live.",
+            f"6. {cost} Sono i valori della specifica originale (pensati per BTC), mantenuti invariati; su un CFD oro il "
+            "costo reale è tipicamente lo spread più un'eventuale commissione.",
+            "7. Il volume nei dati HistData è sempre 0 (la fonte non lo fornisce); la strategia non usa il volume.",
+            f"8. {both}",
+        ]
+    return [
+        "1. Il simbolo è **BTCUSDT** (quotato in USDT, non BTCUSD), mercato **SPOT di un solo exchange** (Binance).",
+        "2. Su spot non si può andare short: gli **short sono SIMULATI** come se fossero su un perpetual o CFD, "
+        "**senza funding e senza costi di prestito**: i risultati degli short sono teorici.",
+        "3. I prezzi possono differire leggermente da quelli del perpetual o del CFD su cui verrebbe eseguita la "
+        "strategia in live.",
+        f"4. Funding non incluso. {cost}",
+        f"5. {both}",
+    ]
+
+
 def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict, res: ReplayResult,
                  bd: Dict[str, pd.DataFrame], notes: List[str]) -> None:
     tr = pd.DataFrame(res.trades)
     L: List[str] = []
-    L.append("# Report backtest - Supertrend + EMA 50/100 su BTCUSDT 15m\n")
+    L.append(f"# Report backtest - Supertrend + EMA 50/100 su {rep.symbol} 15m\n")
     L.append("*Report generato automaticamente da `backtest.py`. Backtest eseguito una sola volta, parametri fissi, "
              "nessuna ottimizzazione.*\n")
     L.append("## Dichiarazioni obbligatorie\n")
-    L.append("1. Il simbolo è **BTCUSDT** (quotato in USDT, non BTCUSD), mercato **SPOT di un solo exchange** (Binance).")
-    L.append("2. Su spot non si può andare short: gli **short sono SIMULATI** come se fossero su un perpetual o CFD, "
-             "**senza funding e senza costi di prestito**: i risultati degli short sono teorici.")
-    L.append("3. I prezzi possono differire leggermente da quelli del perpetual o del CFD su cui verrebbe eseguita la "
-             "strategia in live.")
-    L.append("4. Funding non incluso. Costi: commissione taker "
-             f"{COMMISSION_RATE * 100:.2f}% per lato e slippage {SLIPPAGE_RATE * 100:.2f}% per lato (anche sul TP).")
-    L.append("5. Se nella stessa candela 1m sono toccati sia SL sia TP si assume lo **SL** (ipotesi conservativa).\n")
+    for line in declarations(rep):
+        L.append(line)
+    L.append("")
 
     L.append("## Strategia\n")
     L.append(f"- Supertrend ATR {st.ST_ATR_PERIOD} (RMA di Wilder), moltiplicatore {st.ST_MULTIPLIER}; filtro EMA "
@@ -903,10 +1067,23 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
              f"{fmt(rep.zero_volume_rows)}; sovrapposizioni tra mesi: {fmt(len(rep.month_overlaps))}")
     L.append(f"- Candele 15m: {fmt(rep.candles_15m)} (incomplete: {fmt(rep.candles_incomplete)}; intere candele mancanti: "
              f"{fmt(rep.candles_missing)})")
+    L.append(f"- Buchi per tipo: {rep.gaps_by_type}; minuti mancanti per tipo: {rep.missing_minutes_by_type}")
     big = [g for g in rep.gaps if g[2] > LARGE_GAP_MINUTES]
-    L.append(f"- Buchi superiori a {LARGE_GAP_MINUTES} minuti: {len(big)}")
-    for s_, e_, n_ in big:
+    big_other = [g for g in big if g[3] == GAP_OTHER]
+    big_expected = [g for g in big if g[3] != GAP_OTHER]
+    L.append(f"- Buchi superiori a {LARGE_GAP_MINUTES} minuti: {len(big)} (chiusure di mercato previste: "
+             f"{len(big_expected)}; altri, es. festività o dati mancanti: {len(big_other)})")
+    L.append(f"- Buchi > {LARGE_GAP_MINUTES} minuti NON spiegati da weekend/pausa giornaliera:")
+    for s_, e_, n_, k_ in big_other:
         L.append(f"  - {s_} -> {e_}: {n_} minuti ({n_ / 60:.1f} ore)")
+    if big_expected:
+        L.append(f"- Chiusure previste > {LARGE_GAP_MINUTES} minuti (elenco completo in `data_gaps.csv`):")
+        for s_, e_, n_, k_ in big_expected:
+            L.append(f"  - {s_} -> {e_}: {n_ / 60:.1f} ore [{k_}]")
+    if not tr.empty:
+        L.append(f"- Trade rimasti aperti durante un buco o una chiusura: {int(tr['gap_during_trade'].sum())}; "
+                 f"chiusi all'open oltre SL/TP (gap): {int(tr['exit_at_open_beyond_level'].sum())}")
+    L.append(f"- Buy & hold del sottostante nel periodo di trading: {fmt(m.get('buy_and_hold_pct', float('nan')))}%")
     L.append("")
 
     L.append("## Risultati principali\n")
@@ -959,10 +1136,16 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
         L.append(f"- {n_}")
     L.append("")
     L.append("## Punti deboli e rischi\n")
-    L.append("- Un solo strumento, un solo exchange, un solo periodo (2023-2024, prevalentemente rialzista per BTC): "
-             "il filtro EMA favorisce i long in un mercato in salita, quindi il risultato può riflettere il regime più "
-             "che un vantaggio della regola.")
-    L.append("- Short teorici (spot), senza funding: in live su perpetual il funding può essere significativo.")
+    L.append(f"- Un solo strumento ({rep.symbol}), una sola fonte dati, un solo periodo "
+             f"({rep.first_time.year}-{rep.last_time.year}); buy & hold nel periodo = "
+             f"{fmt(m.get('buy_and_hold_pct', float('nan')))}%. In un mercato prevalentemente rialzista il filtro EMA "
+             "favorisce i long, quindi il risultato può riflettere il regime più che un vantaggio della regola.")
+    if rep.data_format == FORMAT_HISTDATA:
+        L.append("- Swap/finanziamento overnight non inclusi; i trade che restano aperti più giorni li pagherebbero in live.")
+        L.append("- Gap di riapertura (lunedì, dopo festività): lo SL non protegge al suo livello; il backtest chiude "
+                 "all'open, ma con dati BID e senza spread reale l'uscita in live può essere peggiore.")
+    else:
+        L.append("- Short teorici (spot), senza funding: in live su perpetual il funding può essere significativo.")
     L.append("- Stop sulla linea del Supertrend: distanze talvolta strette, quindi costi elevati in R e leva implicita alta.")
     L.append("- Anche senza ottimizzazione, la scelta dei parametri (10/3, 50/100, RR 2) è stata fatta a priori da "
              "conoscenze diffuse: c'è comunque un rischio di selezione implicita.")
@@ -982,8 +1165,8 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
 # Main
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Backtest Supertrend + EMA 50/100 su BTCUSDT 15m")
-    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="cartella dei dati 1m Binance")
+    p = argparse.ArgumentParser(description="Backtest Supertrend + EMA 50/100, timeframe 15m")
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="cartella dei dati 1m (HistData o Binance)")
     p.add_argument("--name", default=DEFAULT_NAME, help="nome del file unico (senza estensione)")
     p.add_argument("--out", default=DEFAULT_OUT, help="cartella di output")
     return p.parse_args(argv)
@@ -992,11 +1175,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     log_path = setup_logging(args.out)
-    log.info("=== BACKTEST Supertrend + EMA (BTCUSDT 15m) ===")
+    log.info("=== BACKTEST Supertrend + EMA 50/100 (15m) ===")
     log.info("Parametri strategia (fissi): ATR=%d, mult=%.1f, EMA=%d/%d, RR=%.1f, rischio=%.2f%%, warm-up=%d",
              st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.EMA_FAST, st.EMA_SLOW, st.RR, st.RISK_PER_TRADE * 100,
              st.WARMUP_CANDLES)
-    log.info("Esecuzione: capitale %.0f, commissione %.3f%%/lato, slippage %.3f%%/lato, funding non incluso",
+    log.info("Esecuzione: capitale %.0f, commissione %.3f%%/lato, slippage %.3f%%/lato, funding/swap non inclusi",
              INITIAL_CAPITAL, COMMISSION_RATE * 100, SLIPPAGE_RATE * 100)
     log.info("Assunzioni: ingresso all'open della prima 1m disponibile della candela 15m successiva; SL/TP su 1m dalla "
              "1m di ingresso inclusa; SL e TP toccati nella stessa 1m => SL; 1m che apre oltre SL/TP (es. dopo un buco) "
@@ -1023,6 +1206,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     m = compute_metrics(res)
     m2 = compute_metrics(res2)
+    # rendimento del sottostante nello stesso periodo di trading (riferimento per il regime di mercato)
+    bh = (md.m_close[-1] / md.candles[st.WARMUP_CANDLES].open - 1.0) * 100
+    m["buy_and_hold_pct"] = m2["buy_and_hold_pct"] = float(bh)
+    log.info("Buy & hold del sottostante nel periodo di trading: %.2f%%", bh)
     bd = breakdowns(res)
 
     out = args.out
@@ -1032,13 +1219,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     pd.DataFrame(res.trades).to_csv(os.path.join(out, "trades.csv"), index=False)
     pd.DataFrame(res.signals).to_csv(os.path.join(out, "trend_changes.csv"), index=False)
     pd.DataFrame(res.skipped).to_csv(os.path.join(out, "skipped_trades.csv"), index=False)
-    pd.DataFrame([{"inizio": a, "fine": b, "minuti_mancanti": c} for a, b, c in rep.gaps]).to_csv(
+    pd.DataFrame([{"inizio": a, "fine": b, "minuti_mancanti": c, "tipo": k} for a, b, c, k in rep.gaps]).to_csv(
         os.path.join(out, "data_gaps.csv"), index=False)
     for name, d in bd.items():
         d.to_csv(os.path.join(out, f"breakdown_{name}.csv"), index=False)
     pd.DataFrame({"time": pd.to_datetime(res.equity_time_ns, utc=True), "equity": res.equity}).to_csv(
         os.path.join(out, "equity_curve.csv"), index=False)
-    plot_equity(res, os.path.join(out, "equity_drawdown.png"))
+    plot_equity(res, os.path.join(out, "equity_drawdown.png"), rep.symbol)
     notes = robustness(res, m, m2, bd)
     write_report(os.path.join(out, "report.md"), rep, files, m, m2, res, bd, notes)
 

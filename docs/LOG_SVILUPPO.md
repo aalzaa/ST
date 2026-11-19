@@ -56,3 +56,25 @@
 - Test "posizione aperta + cambio opposto con EMA concordi": i dati sintetici non contenevano il caso;
   il test ora costruisce lo scenario in modo deterministico.
 - Report: formattazione dei gruppi (anno) e dei conteggi nelle tabelle markdown.
+
+## Aggiornamento: dati XAUUSD (HistData.com)
+
+L'utente ha comunicato che i dati non sono Binance BTCUSDT ma **XAUUSD M1 da HistData.com**,
+nella cartella `C:\Users\Admin\Downloads\dati` (file `XAUUSD_M1_2023_2024.csv`, più i file annuali
+`DAT_ASCII_XAUUSD_M1_2023/2024.csv` e i `.txt` di report di HistData).
+
+Modifiche (solo `backtest.py` e test; **`strategy.py` invariato**, parametri invariati):
+- default `--data-dir` = `C:\Users\Admin\Downloads\dati`, `--name` = `XAUUSD_M1_2023_2024`;
+- formato rilevato dal contenuto: HistData `YYYYMMDD HHMMSS;O;H;L;C;V` con separatore `;`;
+- orari HistData in EST fisso (UTC-5 tutto l'anno) → UTC con +5 ore (assunzione documentata da HistData);
+- buchi classificati in `chiusura_weekend`, `pausa_giornaliera` (17-18 New York, con ora legale) e `altro`;
+  nel report sono elencati in dettaglio i buchi > 60 minuti di tipo `altro` (es. festività, dati mancanti);
+- dichiarazioni del report adattate: fonte unica, prezzi BID, mercato non 24/7, short possibili su CFD,
+  swap non inclusi, spread non modellato esplicitamente;
+- costi lasciati ai valori della specifica (0,05% + 0,02% per lato), dichiarati come tali;
+- aggiunta la metrica `buy_and_hold_pct` del sottostante nel periodo di trading, per giudicare il regime;
+- nuovo test `test_histdata_format_and_gaps` (14/14 test superati).
+
+Prova tecnica su un file sintetico in formato HistData con gli orari reali dell'oro (2023-2024):
+520 buchi, tutti classificati correttamente (416 pause giornaliere, 104 weekend). Anche qui i numeri
+di performance sono sintetici e privi di significato.

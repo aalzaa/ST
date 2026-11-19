@@ -1,6 +1,6 @@
-# Supertrend + EMA 50/100 — BTCUSDT 15m
+# Supertrend + EMA 50/100 — 15m (dati attuali: XAUUSD)
 
-Strategia su BTC (timeframe 15 minuti) con ingresso sul cambio di trend del Supertrend
+Strategia (timeframe 15 minuti), nata per BTC e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
 (ATR 10, moltiplicatore 3) e filtro di trend EMA 50/100. Uscite solo per stop loss
 (linea del Supertrend sulla candela di cambio, fisso) o take profit (2R, fisso).
 Parametri fissi, nessuna ottimizzazione.
@@ -44,9 +44,21 @@ nulla o negativa ⇒ trade saltato" non sarebbe possibile.
 
 ## Dati
 
-Default: cartella `C:\Users\Admin\Downloads\dati backtest`, file `BTCUSDT_1m_2023-2024`
-(.csv, .parquet o .zip). Se non c'è un file unico, vengono uniti in ordine cronologico i file
-mensili `BTCUSDT-1m-YYYY-MM.csv` / `.zip` di data.binance.vision (spot, klines 1m).
+Default: cartella `C:\Users\Admin\Downloads\dati`, file `XAUUSD_M1_2023_2024` (.csv/.txt/.zip/.parquet).
+Se non c'è un file unico, vengono uniti in ordine cronologico i file annuali HistData
+`DAT_ASCII_<SIMBOLO>_M1_YYYY.csv` (i `.txt` di HistData sono report sui buchi e vengono ignorati),
+oppure i file mensili Binance `BTCUSDT-1m-YYYY-MM.csv/.zip`.
+
+Formati riconosciuti automaticamente dal contenuto:
+- **HistData.com ASCII M1** (es. XAUUSD): `YYYYMMDD HHMMSS;open;high;low;close;volume`,
+  orari in **EST fisso (UTC-5, senza ora legale)** → convertiti in UTC (+5 ore). Volume sempre 0.
+- **Binance klines 1m** (12 colonne, timestamp in ms o µs).
+
+Per XAUUSD il mercato non è 24/7: chiusure del weekend e pausa giornaliera (17-18 ora di New York)
+sono riconosciute e classificate nel log e in `data_gaps.csv` (colonna `tipo`), non vengono
+riempite e le candele 15m mancanti non vengono passate alla strategia. Un trade aperto durante
+una chiusura viene verificato sulla prima 1m disponibile (uscita all'open se apre oltre SL o TP).
+
 I dati oltre il 31/12/2025 fanno interrompere il backtest con errore.
 
 ## Comandi Windows
@@ -77,7 +89,7 @@ python backtest.py
 Opzioni:
 
 ```bat
-python backtest.py --data-dir "C:\Users\Admin\Downloads\dati backtest" --name BTCUSDT_1m_2023-2024 --out output
+python backtest.py --data-dir "C:\Users\Admin\Downloads\dati" --name XAUUSD_M1_2023_2024 --out output
 ```
 
 Eseguire i test **prima** del backtest. Il backtest va eseguito **una sola volta**; si rilancia
@@ -124,8 +136,9 @@ Note per il live:
 
 ## Dichiarazioni
 
-1. Il simbolo è **BTCUSDT** (quotato in USDT, non BTCUSD), mercato **SPOT di un solo exchange** (Binance).
-2. Su spot non si può andare short: gli short sono **simulati** come se fossero su un perpetual o CFD,
-   senza funding e senza costi di prestito, quindi i risultati degli short sono teorici.
-3. I prezzi possono differire leggermente da quelli del perpetual o CFD su cui verrebbe eseguita la strategia in live.
-4. Funding non incluso. Costi: commissione taker 0,05% per lato, slippage 0,02% per lato.
+Le dichiarazioni complete vengono scritte in `output/report.md` in base alla fonte dei dati. Per XAUUSD (HistData):
+1. una sola fonte, quotazioni BID di un feed FX/CFD; orari EST fisso convertiti in UTC;
+2. mercato non 24/7 (weekend e pausa giornaliera), buchi non riempiti;
+3. short possibili su CFD; swap/finanziamento overnight non inclusi;
+4. spread non modellato esplicitamente (solo slippage 0,02% per lato); commissione 0,05% per lato
+   (valori della specifica originale, mantenuti invariati); i prezzi possono differire dal broker live.

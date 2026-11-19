@@ -410,6 +410,40 @@ def test_data_checks_and_resample():
     return "duplicati, ordinamento, buchi, aggregazione 15m e limite 2025 verificati"
 
 
+def test_histdata_format_and_gaps():
+    import os
+    import tempfile
+    lines = [
+        "20230102 180000;1826.837000;1827.337000;1826.617000;1826.637000;0",
+        "20230102 180100;1826.537000;1827.357000;1826.137000;1826.537000;0",
+        "20230102 180200;1826.137000;1826.737000;1826.137000;1826.737000;0",
+        "20230102 180500;1827.187000;1828.867000;1827.187000;1828.738000;0",
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "XAUUSD_M1_2023_2024.csv")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        assert bt.detect_format(path) == bt.FORMAT_HISTDATA
+        assert bt.find_data_files(d, "XAUUSD_M1_2023_2024") == [path]
+        raw, info = bt.load_raw_klines([path])
+        assert info["format"] == bt.FORMAT_HISTDATA and info["symbol"] == "XAUUSD"
+        # 18:00 EST fisso (UTC-5) => 23:00 UTC
+        assert bt.ts(raw["time_ns"].iloc[0]) == pd.Timestamp("2023-01-02 23:00", tz="UTC")
+        assert raw["open"].iloc[0] == 1826.837 and raw["close"].iloc[3] == 1828.738
+        clean, rep = bt.check_and_clean(raw, info)
+        assert rep.missing_minutes == 2 and rep.gaps[0][3] == bt.GAP_OTHER
+    # classificazione chiusure (orari UTC)
+    fri = pd.Timestamp("2023-01-06 22:00", tz="UTC")     # venerdì 17:00 New York
+    sun = pd.Timestamp("2023-01-08 22:59", tz="UTC")     # domenica 17:59 New York
+    assert bt.classify_gap(fri, sun, int((sun - fri).total_seconds() // 60) + 1, bt.FORMAT_HISTDATA) == bt.GAP_WEEKEND
+    daily_s = pd.Timestamp("2023-07-11 21:00", tz="UTC")  # 17:00 New York (ora legale)
+    assert bt.classify_gap(daily_s, daily_s + pd.Timedelta(minutes=59), 60, bt.FORMAT_HISTDATA) == bt.GAP_DAILY
+    mid = pd.Timestamp("2023-07-11 14:00", tz="UTC")
+    assert bt.classify_gap(mid, mid + pd.Timedelta(minutes=89), 90, bt.FORMAT_HISTDATA) == bt.GAP_OTHER
+    assert bt.classify_gap(fri, sun, 3000, bt.FORMAT_BINANCE) == bt.GAP_OTHER
+    return "formato HistData (EST -> UTC) e classificazione weekend / pausa giornaliera"
+
+
 TESTS = [
     test_atr_ema_seed_availability,
     test_indicators_match_reference,
@@ -424,6 +458,7 @@ TESTS = [
     test_execution_sl_and_tp_same_minute,
     test_execution_gap_exit_at_open,
     test_data_checks_and_resample,
+    test_histdata_format_and_gaps,
 ]
 
 

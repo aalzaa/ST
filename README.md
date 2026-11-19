@@ -2,7 +2,7 @@
 
 | Cartella / file | Contenuto |
 |---|---|
-| [`supertrend_ema_btc_15m/`](supertrend_ema_btc_15m/) | strategia (`strategy.py`), backtest (`backtest.py`), test (`test_strategy.py`), README con i comandi Windows e l'uso in live |
+| [`supertrend_ema_btc_15m/`](supertrend_ema_btc_15m/) | strategia (testata su dati XAUUSD HistData) (`strategy.py`), backtest (`backtest.py`), test (`test_strategy.py`), README con i comandi Windows e l'uso in live |
 | [`docs/LOG_SVILUPPO.md`](docs/LOG_SVILUPPO.md) | decisioni, assunzioni e stato della verifica |
 
 Avvio rapido (Windows, cmd):
