@@ -1,4 +1,4 @@
-# Log di sviluppo — OTE Fibonacci XAUUSD 15m
+# Log di sviluppo — OTE Fibonacci XAUUSD (versione attuale: entry M5, trend EMA H1)
 
 ## Stato
 
@@ -101,3 +101,31 @@
 
 ### Correzioni durante lo sviluppo (bug tecnici, nessuna modifica di strategia)
 - Generatore di dati sintetici dei test: pandas 3 crea indici in microsecondi; convertiti in nanosecondi.
+
+## Aggiornamento: swing ed entry su M5, trend EMA 50/100 su H1 (richiesta esplicita dell'utente)
+
+- `strategy.py`: `TIMEFRAME_MINUTES = 5` (candele alimentate: M5) e nuovo `TREND_TIMEFRAME_MINUTES = 60`.
+  Pivot 5/5, zigzag, dealing range, livelli, limite, SL, TP, ATR(14) per l'ampiezza: tutto su M5.
+  EMA 50 / EMA 100 (e l'ATR(14) usato per la soglia di separazione) su candele H1.
+- **Aggregazione H1 dentro la strategia** (stesso codice in backtest e live, interfaccia invariata: si passano solo
+  le M5). Bucket orario UTC; una H1 si chiude alla chiusura della M5 delle :55, oppure — se quella manca per un
+  buco — all'arrivo della prima M5 di un'ora successiva, prima di elaborare quella M5. Le EMA H1 alla chiusura di
+  una M5 sono quindi quelle dell'ultima H1 chiusa: nessun dato futuro.
+- **Scelte prese in autonomia** (l'utente non le ha specificate):
+  - separazione EMA misurata in ATR(14) **H1** (stesso timeframe delle EMA; con l'ATR M5 il filtro sarebbe molto più
+    permissivo); ampiezza del range in ATR(14) **M5** (stesso timeframe degli swing);
+  - incroci e separazione contati sulle candele M5 dello swing, ognuna con il gap EMA H1 valido in quel momento
+    (un incrocio H1 conta una sola volta);
+  - `ORDER_EXPIRY_CANDLES = 48` resta in candele del timeframe di ingresso: **48 M5 = 4 ore** di mercato (prima 12
+    ore). Come i pivot 5/5, la scadenza scala con il timeframe della struttura;
+  - nuovo `WARMUP_TREND_CANDLES = 200`: nessun ordine finché non ci sono almeno 500 M5 **e** 200 H1 chiuse (EMA 100
+    seminata alla 100ª H1 + 100 di assestamento). In live servono almeno ~2400 M5 di storico.
+- `backtest.py`: etichette e colonne generiche (`duration_candles` al posto di `duration_candles_15m`); il periodo
+  di trading (CAGR, Sharpe, equity, % tempo in posizione, buy & hold) parte dalla prima chiusura fuori dal warm-up.
+- Test: riferimento indipendente del trend H1 (aggregazione oraria con la stessa regola di chiusura, EMA/ATR H1,
+  numero di H1 chiuse per ogni M5) e nuovo test sulla causalità delle H1 (chiusura alle :55, :55 mancante).
+  **23/23 superati.** Pipeline completa provata su dati sintetici 2023-2024 (~20 s); numeri non significativi.
+- Nome della cartella invariato (`ote_fib_xauusd_15m`) per non rompere i percorsi.
+- **Nota metodologica**: è una seconda variante della strategia. Se verrà scelta confrontando i risultati con la
+  versione 15m sugli stessi dati 2023-2024, è ottimizzazione manuale: i risultati vanno considerati in-sample e
+  validati su dati mai visti o in paper trading.

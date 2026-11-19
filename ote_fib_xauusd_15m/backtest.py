@@ -1,8 +1,9 @@
 """
-Backtest della strategia OTE Fibonacci su XAUUSD 15m definita in strategy.py.
+Backtest della strategia OTE Fibonacci su XAUUSD definita in strategy.py (swing ed entry su M5,
+trend dalle EMA 50/100 su H1 calcolate dalla strategia stessa).
 
 Questo file contiene tutto ciò che NON è logica di trading: caricamento e controllo dei dati 1m
-HistData, aggregazione in candele 15m, replay candela per candela (come un loop live), simulazione
+HistData, aggregazione nel timeframe della strategia (st.TIMEFRAME_MINUTES), replay candela per candela (come un loop live), simulazione
 dell'esecuzione degli ordini limite e di SL/TP sulle candele base 1m, costi, metriche, grafici,
 report e salvataggio. Le regole di trading stanno SOLO in strategy.py e qui vengono usate senza
 duplicarle.
@@ -61,6 +62,8 @@ TRADING_DAYS_PER_YEAR = 252
 
 MINUTE_NS = 60 * 1_000_000_000
 TF_NS = st.TIMEFRAME_MINUTES * MINUTE_NS
+TF_LABEL = f"M{st.TIMEFRAME_MINUTES}" if st.TIMEFRAME_MINUTES < 60 else f"H{st.TIMEFRAME_MINUTES // 60}"
+TREND_LABEL = f"H{st.TREND_TIMEFRAME_MINUTES // 60}" if st.TREND_TIMEFRAME_MINUTES >= 60 else f"M{st.TREND_TIMEFRAME_MINUTES}"
 MARKET_TZ = "America/New_York"    # usato SOLO per verificare il calendario di mercato, mai per convertire i dati
 
 FMT_GENERIC = "HistData Generic ASCII"
@@ -326,9 +329,9 @@ class DataReport:
     weeks: Optional[pd.DataFrame] = None
     week_fail_ratio: float = 0.0
     tz_anomaly: bool = False
-    candles_15m: int = 0
-    candles_15m_incomplete: int = 0
-    candles_15m_missing_in_market: int = 0
+    candles_tf: int = 0
+    candles_tf_incomplete: int = 0
+    candles_tf_missing_in_market: int = 0
 
 
 def wilder_atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
@@ -538,11 +541,11 @@ def check_week_opens(gaps: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
 
 
 # ---------------------------------------------------------------------------
-# Candele 15m
+# Candele del timeframe della strategia
 # ---------------------------------------------------------------------------
 @dataclass
 class MarketData:
-    """Candele base 1m e candele 15m (solo quelle con almeno una candela base)."""
+    """Candele base 1m e candele del timeframe della strategia (solo quelle con almeno una candela base)."""
     t1: np.ndarray
     o1: np.ndarray
     h1: np.ndarray
@@ -555,7 +558,7 @@ class MarketData:
     c15: np.ndarray
     v15: np.ndarray
     n_base: np.ndarray
-    start: np.ndarray      # indice della prima candela base di ogni candela 15m
+    start: np.ndarray      # indice della prima candela base di ogni candela della strategia
     end: np.ndarray        # indice successivo all'ultima candela base
 
     def candle(self, k: int) -> st.Candle:
@@ -565,7 +568,7 @@ class MarketData:
 
 
 def build_market_data(df: pd.DataFrame, rep: Optional[DataReport] = None) -> MarketData:
-    """Aggrega le candele base in 15m allineate a :00/:15/:30/:45 UTC. Nessun dato inventato."""
+    """Aggrega le candele base nel timeframe della strategia, allineate a multipli di TF da mezzanotte UTC."""
     t = df["time_ns"].to_numpy().astype(np.int64)
     o, h, l, c, v = (df[x].to_numpy().astype(float) for x in ["open", "high", "low", "close", "volume"])
     bucket = t - (t % TF_NS)
@@ -575,17 +578,17 @@ def build_market_data(df: pd.DataFrame, rep: Optional[DataReport] = None) -> Mar
                     h15=np.maximum.reduceat(h, starts), l15=np.minimum.reduceat(l, starts), c15=c[ends - 1],
                     v15=np.add.reduceat(v, starts), n_base=ends - starts, start=starts, end=ends)
     if rep is not None:
-        rep.candles_15m = len(starts)
-        rep.candles_15m_incomplete = int((md.n_base < st.TIMEFRAME_MINUTES).sum())
+        rep.candles_tf = len(starts)
+        rep.candles_tf_incomplete = int((md.n_base < st.TIMEFRAME_MINUTES).sum())
         d15 = np.diff(md.t15) // TF_NS - 1
-        rep.candles_15m_missing_in_market = 0
+        rep.candles_tf_missing_in_market = 0
         if rep.gaps is not None and len(rep.gaps):
             an = rep.gaps[rep.gaps["categoria"] == GAP_ANOMALOUS]
-            rep.candles_15m_missing_in_market = int((an["minuti_mancanti"] // st.TIMEFRAME_MINUTES).sum())
-        log.info("=== CANDELE 15m ===")
-        log.info("Candele 15m costruite: %d; incomplete (meno di 15 candele base, marcate): %d; "
-                 "intervalli 15m senza candele (non alimentati alla strategia): %d",
-                 rep.candles_15m, rep.candles_15m_incomplete, int(d15[d15 > 0].sum()))
+            rep.candles_tf_missing_in_market = int((an["minuti_mancanti"] // st.TIMEFRAME_MINUTES).sum())
+        log.info("=== CANDELE %s ===", TF_LABEL)
+        log.info("Candele %s costruite: %d; incomplete (meno di %d candele base, marcate): %d; "
+                 "intervalli %s senza candele (non alimentati alla strategia): %d", TF_LABEL,
+                 rep.candles_tf, st.TIMEFRAME_MINUTES, rep.candles_tf_incomplete, TF_LABEL, int(d15[d15 > 0].sum()))
     return md
 
 
@@ -621,7 +624,7 @@ class ReplayResult:
     trades: pd.DataFrame
     orders: pd.DataFrame
     ranges: pd.DataFrame
-    equity: pd.Series            # equity mark-to-market alla chiusura di ogni candela 15m di trading
+    equity: pd.Series            # equity mark-to-market alla chiusura di ogni candela di trading
     in_position: pd.Series       # True se a fine candela c'è una posizione aperta
     actions_log: List[Tuple[int, List[st.Action]]]
     inputs_log: List[Tuple[int, Optional[st.Position], Optional[st.PendingOrder]]]
@@ -644,7 +647,7 @@ def session_of(ts_: pd.Timestamp) -> str:
 def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: float = INITIAL_CAPITAL,
                record_actions: bool = False, verbose: bool = True) -> ReplayResult:
     """
-    Replay come un loop live: a ogni chiusura 15m la strategia riceve la candela, la posizione e l'ordine
+    Replay come un loop live: a ogni chiusura di candela (M5) la strategia riceve la candela, la posizione e l'ordine
     pendente correnti. Le Action emesse alla chiusura della candela N si applicano dalla prima candela base
     della candela N+1. Fill, SL e TP sono simulati sulle candele base 1m.
     """
@@ -690,7 +693,7 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
             "exit_at_open": at_open, "exit_after_gap_min": gap_min if at_open else 0,
             "duration_hours": (exit_time - rec["fill_time"]).total_seconds() / 3600.0,
         })
-        rec["duration_candles_15m"] = None
+        rec["duration_candles"] = None
         equity += pnl
         trades.append(rec)
         pos = None
@@ -767,6 +770,7 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
         check_exit(j, fill_bar=True)
 
     queued_meta: Dict[str, Dict] = {}
+    live_k: Optional[int] = None
     inputs_log: List[Tuple[int, Optional[st.Position], Optional[st.PendingOrder]]] = []
     for k in range(warm, n15):
         active_from = pd.Timestamp(int(t1[md.start[k]]), tz="UTC")
@@ -786,7 +790,7 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
                 pend_info["active_from"] = active_from
                 orders[a.id]["active_from"] = active_from
         queued = []
-        # 2) candele base della candela 15m k
+        # 2) candele base della candela k
         if pos is not None or pend is not None:
             for j in range(md.start[k], md.end[k]):
                 if pos is not None:
@@ -802,9 +806,6 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
             d = 1.0 if pos.side == st.LONG else -1.0
             mtm += (close_k - pos.entry) * d * pos.qty * st.CONTRACT_SIZE_OZ
         close_time = pd.Timestamp(int(md.t15[k] + TF_NS), tz="UTC")
-        eq_t.append(close_time)
-        eq_v.append(mtm)
-        inpos.append(pos is not None)
 
         candle = md.candle(k)
         if record_actions:
@@ -815,6 +816,13 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
             raise RuntimeError("La strategia ha emesso Action con una posizione aperta")
         if record_actions:
             actions_log.append((k, list(actions)))
+        if not strat.in_warmup:
+            # periodo di trading: dalla prima chiusura in cui la strategia può operare (warm-up M5 e H1 completati)
+            if live_k is None:
+                live_k = k
+            eq_t.append(close_time)
+            eq_v.append(mtm)
+            inpos.append(pos is not None)
         for leg in strat.legs_this_candle:
             r = dict(leg)
             r["confirm_time"] = close_time
@@ -843,6 +851,9 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
 
     # fine dati
     last_j = len(t1) - 1
+    if live_k is None:
+        raise ValueError(f"Dati insufficienti: il warm-up ({st.WARMUP_CANDLES} candele {TF_LABEL} e "
+                         f"{st.WARMUP_TREND_CANDLES} candele {TREND_LABEL}) non si completa")
     if pos is not None:
         close_trade(last_j, c1[last_j], EXIT_END, False)
         if eq_v:
@@ -857,15 +868,15 @@ def run_replay(md: MarketData, costs: Optional[Costs] = None, initial_capital: f
     if len(trades_df):
         f15 = np.searchsorted(md.t15, trades_df["fill_time"].map(lambda x: x.value).to_numpy(), side="right")
         e15 = np.searchsorted(md.t15, trades_df["exit_time"].map(lambda x: x.value).to_numpy(), side="right")
-        trades_df["duration_candles_15m"] = e15 - f15 + 1
+        trades_df["duration_candles"] = e15 - f15 + 1
     equity_s = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t), name="equity")
     res = ReplayResult(
         trades=trades_df, orders=pd.DataFrame(list(orders.values())), ranges=pd.DataFrame(ranges),
         equity=equity_s, in_position=pd.Series(inpos, index=equity_s.index), actions_log=actions_log,
         inputs_log=inputs_log,
-        start_time=pd.Timestamp(int(md.t15[warm]), tz="UTC") if warm < n15 else pd.Timestamp(int(md.t15[-1]), tz="UTC"),
+        start_time=pd.Timestamp(int(md.t15[live_k] + TF_NS), tz="UTC") if live_k is not None else pd.Timestamp(int(t1[-1]), tz="UTC"),
         end_time=pd.Timestamp(int(t1[-1]), tz="UTC"), skipped=skipped, costs=costs,
-        first_trading_close=float(md.c15[warm - 1]) if warm > 0 else float(md.c15[0]),
+        first_trading_close=float(md.c15[live_k]) if live_k is not None else float("nan"),
         last_close=float(c1[-1]),
     )
     return res
@@ -963,8 +974,8 @@ def compute_metrics(res: ReplayResult, initial_capital: float = INITIAL_CAPITAL)
     m["durata_media_ore"] = float(closed["duration_hours"].mean()) if n else float("nan")
     m["durata_mediana_ore"] = float(closed["duration_hours"].median()) if n else float("nan")
     m["durata_massima_ore"] = float(closed["duration_hours"].max()) if n else float("nan")
-    m["durata_media_candele_15m"] = float(closed["duration_candles_15m"].mean()) if n else float("nan")
-    m["durata_massima_candele_15m"] = float(closed["duration_candles_15m"].max()) if n else float("nan")
+    m["durata_media_candele"] = float(closed["duration_candles"].mean()) if n else float("nan")
+    m["durata_massima_candele"] = float(closed["duration_candles"].max()) if n else float("nan")
     m["tempo_in_posizione_pct"] = 100.0 * float(res.in_position.mean()) if len(res.in_position) else 0.0
     m["costi_totali_usd"] = float(closed["costs"].sum()) if n else 0.0
     m["costo_medio_r"] = float((closed["r_gross"] - closed["r"]).mean()) if n else float("nan")
@@ -1054,7 +1065,7 @@ def plot_equity(res: ReplayResult, path: str) -> None:
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
     ax1.plot(eq.index, eq.values, color="#1f5fa8", lw=1.2)
     ax1.axhline(INITIAL_CAPITAL, color="grey", lw=0.8, ls="--")
-    ax1.set_title(f"{SYMBOL} 15m - OTE Fibonacci (0.705) con filtro EMA 50/100 - equity (USD, mark-to-market)")
+    ax1.set_title(f"{SYMBOL} {TF_LABEL} - OTE Fibonacci (0.705) con filtro EMA 50/100 {TREND_LABEL} - equity (USD, mark-to-market)")
     ax1.set_ylabel("Equity USD")
     ax1.grid(alpha=0.3)
     dd = (eq / eq.cummax() - 1) * 100
@@ -1068,7 +1079,7 @@ def plot_equity(res: ReplayResult, path: str) -> None:
 
 
 def plot_trade(md: MarketData, trade: pd.Series, path: str, title: str) -> None:
-    """Candele 15m (UTC) con dealing range, box OTE giallo, midline 0.5, limite, SL, TP e marker fill/uscita."""
+    """Candele della strategia (UTC) con dealing range, box OTE giallo, midline 0.5, limite, SL, TP e marker fill/uscita."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1210,7 +1221,7 @@ def declarations(rep: DataReport) -> List[str]:
         "2. I prezzi XAUUSD differiscono tra broker e fornitori di dati (feed, spread, orari): i risultati valgono per "
         "questo feed e possono differire da quelli del broker su cui verrebbe eseguita la strategia in live.",
         "3. Il fuso orario è l'EST fisso dichiarato da HistData e verificato con il calendario di mercato (riapertura della "
-        "domenica alle 18:00 di New York): se fosse sbagliato, le candele 15m resterebbero corrette (scostamento di ore "
+        f"domenica alle 18:00 di New York): se fosse sbagliato, le candele {TF_LABEL} e {TREND_LABEL} resterebbero corrette (scostamento di ore "
         "intere) ma il breakdown per sessione no." + (" **ATTENZIONE: la verifica ha segnalato un'anomalia.**"
                                                      if rep.tz_anomaly else ""),
         "4. Swap e finanziamento overnight **non** sono inclusi.",
@@ -1236,7 +1247,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
                  bd: Dict[str, pd.DataFrame], bd2: Dict[str, pd.DataFrame]) -> None:
     L: List[str] = []
     add = L.append
-    add(f"# Report backtest — OTE Fibonacci {SYMBOL} 15m con filtro EMA 50/100\n")
+    add(f"# Report backtest — OTE Fibonacci {SYMBOL}: swing ed entry {TF_LABEL}, filtro EMA 50/100 {TREND_LABEL}\n")
     add("_Report generato automaticamente da `backtest.py` (backtest unico, nessuna ottimizzazione)._\n")
     add("## Dichiarazioni obbligatorie\n")
     L.extend(declarations(rep))
@@ -1248,19 +1259,23 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
         f"confermati ({st.PIVOT_LEFT} candele a sinistra, {st.PIVOT_RIGHT} a destra). Un pivot sulla candela i è noto "
         f"solo alla chiusura della candela i+{st.PIVOT_RIGHT}: **ritardo di {st.PIVOT_RIGHT} candele = "
         f"{st.PIVOT_RIGHT * st.TIMEFRAME_MINUTES} minuti**. La formula dei livelli è identica a quella dell'indicatore.")
-    add(f"- Filtro di trend: EMA {st.EMA_FAST} > EMA {st.EMA_SLOW} → solo OTE long; < → solo short; uguali → nessun "
-        f"ordine. Le EMA devono essere separate di almeno {st.EMA_SEP_MIN_ATR} ATR nella direzione del range in almeno "
-        f"una candela dello swing e incrociarsi al massimo {st.MAX_EMA_CROSSES} volta.")
-    add(f"- Filtri del range: BOS (estremo oltre lo swing precedente), ampiezza ≥ {st.MIN_RANGE_ATR} ATR(14), livello "
+    add(f"- **Multi-timeframe**: swing pivot, dealing range ed entry su candele {TF_LABEL}; filtro di trend con EMA "
+        f"{st.EMA_FAST}/{st.EMA_SLOW} su candele {TREND_LABEL}, costruite dalla strategia aggregando le {TF_LABEL} chiuse "
+        f"(una {TREND_LABEL} è chiusa alla chiusura della {TF_LABEL} delle :55, o all'arrivo della prima {TF_LABEL} "
+        "dell'ora successiva se quella manca): nessun dato futuro.")
+    add(f"- Filtro di trend: EMA {st.EMA_FAST} > EMA {st.EMA_SLOW} ({TREND_LABEL}) → solo OTE long; < → solo short; uguali → "
+        f"nessun ordine. Le EMA {TREND_LABEL} devono essere separate di almeno {st.EMA_SEP_MIN_ATR} ATR {TREND_LABEL} nella "
+        f"direzione del range in almeno una candela dello swing e incrociarsi al massimo {st.MAX_EMA_CROSSES} volta.")
+    add(f"- Filtri del range: BOS (estremo oltre lo swing precedente), ampiezza ≥ {st.MIN_RANGE_ATR} ATR(14) {TF_LABEL}, livello "
         "d'ingresso non già toccato prima della conferma.")
     add(f"- Ingresso solo con limite al livello {st.ENTRY_LEVEL} (zona OTE {st.OTE_LOW}–{st.OTE_HIGH}); SL all'origine "
         f"dell'impulso (1.0), TP all'estremo (0.0): R teorico {fmt(m['rr_teorico'])}. Rischio {st.RISK_PER_TRADE:.0%} "
-        f"dell'equity, lotti arrotondati per difetto a {st.LOT_STEP}. Scadenza {st.ORDER_EXPIRY_CANDLES} candele 15m "
-        "reali. Uscita solo a SL o TP.\n")
+        f"dell'equity, lotti arrotondati per difetto a {st.LOT_STEP}. Scadenza {st.ORDER_EXPIRY_CANDLES} candele {TF_LABEL} "
+        f"reali ({st.ORDER_EXPIRY_CANDLES * st.TIMEFRAME_MINUTES // 60} ore di mercato). Uscita solo a SL o TP.\n")
     add("## Dati\n")
     add(f"- File trovati/usati: {', '.join(os.path.basename(f) for f in files)} (formati: {', '.join(rep.formats)}).")
     add(f"- Periodo effettivo (UTC): **{rep.first_time} → {rep.last_time}**; periodo di trading (dopo il warm-up di "
-        f"{st.WARMUP_CANDLES} candele 15m): {res.start_time} → {res.end_time}. Il 2025 non è nei dati.")
+        f"{st.WARMUP_CANDLES} candele {TF_LABEL} e {st.WARMUP_TREND_CANDLES} candele {TREND_LABEL}): {res.start_time} → {res.end_time}. Il 2025 non è nei dati.")
     add(f"- Righe 1m: caricate {fmt(rep.rows_loaded)}, pulite {fmt(rep.rows_clean)}; duplicati identici "
         f"{fmt(rep.exact_duplicates)}, duplicati conflittuali {fmt(rep.conflicting_duplicates)}, sovrapposizioni tra file "
         f"{len(rep.file_overlaps)}; OHLC incoerenti {fmt(rep.ohlc_inconsistent_rows)}; prezzi non positivi "
@@ -1271,8 +1286,8 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
         cnt = g.groupby("categoria")["minuti_mancanti"].agg(["count", "sum"])
         add("- Buchi nei dati 1m: " + "; ".join(f"{c}: {fmt(int(r['count']))} ({fmt(int(r['sum']))} minuti)"
                                                for c, r in cnt.iterrows()) + ".")
-    add(f"- Candele 15m: {fmt(rep.candles_15m)}, di cui incomplete {fmt(rep.candles_15m_incomplete)} (costruite con le "
-        "candele base disponibili). Le candele 15m del tutto mancanti non vengono alimentate alla strategia: pivot, ATR, "
+    add(f"- Candele {TF_LABEL}: {fmt(rep.candles_tf)}, di cui incomplete {fmt(rep.candles_tf_incomplete)} (costruite con le "
+        "candele base disponibili). Le candele del tutto mancanti non vengono alimentate alla strategia: pivot, ATR, "
         "EMA e scadenze si contano sulla sequenza di candele reali.")
     add(f"- Verifica del fuso (riapertura domenicale): {len(rep.weeks) if rep.weeks is not None else 0} settimane, "
         f"non conformi {fmt(100 * rep.week_fail_ratio, 1)}%"
@@ -1313,7 +1328,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
         f"Saltati per distanza SL nulla/negativa {m['ordini_saltati_distanza_sl']}, sotto il lotto minimo "
         f"{m['ordini_saltati_sotto_min_lot']}; pendenti a fine dati {m['ordini_pendenti_a_fine_dati']}.")
     add(f"- Tempo medio tra piazzamento e fill: {fmt(m['tempo_medio_piazzamento_fill_ore'])} ore "
-        f"({fmt(m['candele_medie_piazzamento_fill'], 1)} candele 15m).")
+        f"({fmt(m['candele_medie_piazzamento_fill'], 1)} candele {TF_LABEL}).")
     add(f"- Trade chiusi: {m['numero_trade']} (TP {m['uscite_tp']}, SL {m['uscite_sl']}), più {m['trade_fine_dati']} "
         "chiusi a fine dati (esclusi dalle statistiche).")
     add("\n## Breakdown\n")
@@ -1330,7 +1345,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
     L.extend(evaluation(m, m2, bd, res))
     add("\n## Durata dei trade\n")
     add(f"Durata media {fmt(m['durata_media_ore'])} h, mediana {fmt(m['durata_mediana_ore'])} h, massima "
-        f"{fmt(m['durata_massima_ore'])} h ({fmt(m['durata_massima_candele_15m'], 0)} candele 15m). Tempo in posizione "
+        f"{fmt(m['durata_massima_ore'])} h ({fmt(m['durata_massima_candele'], 0)} candele {TF_LABEL}). Tempo in posizione "
         f"{fmt(m['tempo_in_posizione_pct'], 1)}%. Range ignorati perché c'era già una posizione aperta: "
         f"{m['range_IGNORATO_POSIZIONE_APERTA']} (su {m['range_ORDINE_PIAZZATO'] + m['range_IGNORATO_POSIZIONE_APERTA']} "
         "range validi): è il costo della regola \"nessuna uscita anticipata, una posizione alla volta\".")
@@ -1357,9 +1372,9 @@ TRADE_COLUMNS = ["order_id", "placed_time", "fill_time", "exit_time", "side", "l
                  "fill_at_open", "entry_exec_price", "sl", "tp", "range_high", "range_high_time", "range_low",
                  "range_low_time", "level_618", "level_705", "level_786", "exit_reason", "exit_price", "exit_exec_price",
                  "exit_at_open", "qty_lots", "risk_pct_effective", "leverage", "gross_pnl", "costs", "commission", "pnl",
-                 "r", "r_gross", "r_theoretical", "duration_hours", "duration_candles_15m", "candles_to_fill",
+                 "r", "r_gross", "r_theoretical", "duration_hours", "duration_candles", "candles_to_fill",
                  "hours_to_fill", "session", "over_weekend", "equity_before", "equity_after"]
-RANGE_COLUMNS = ["confirm_time", "side", "range_high", "range_high_time", "range_low", "range_low_time", "atr",
+RANGE_COLUMNS = ["confirm_time", "side", "range_high", "range_high_time", "range_low", "range_low_time", "atr", "atr_trend",
                  "amplitude_atr", "ema_fast", "ema_slow", "max_sep", "max_sep_time", "crosses", "swing_candles",
                  "prev_extreme", "level_618", "level_705", "level_786", "touched", "outcome", "order_id"]
 
@@ -1398,7 +1413,7 @@ def save_outputs(out: str, md: MarketData, rep: DataReport, files: List[str], re
         losers = closed[closed["pnl"] <= 0].head(3)
         for label, sub in [("vincente", winners), ("perdente", losers)]:
             for n_, (_, t) in enumerate(sub.iterrows(), 1):
-                title = (f"{SYMBOL} 15m - trade {label} {n_}: {t['side']} {t['order_id']} | fill {t['fill_time']:%Y-%m-%d %H:%M} "
+                title = (f"{SYMBOL} {TF_LABEL} - trade {label} {n_}: {t['side']} {t['order_id']} | fill {t['fill_time']:%Y-%m-%d %H:%M} "
                          f"@ {t['fill_price']:.2f} | uscita {t['exit_reason']} {t['exit_time']:%Y-%m-%d %H:%M} | R {t['r']:.2f}")
                 plot_trade(md, t, os.path.join(out, f"esempio_{label}_{n_}.png"), title)
     write_report(os.path.join(out, "report.md"), rep, files, m, m2, res, bd, bd2)
@@ -1406,7 +1421,7 @@ def save_outputs(out: str, md: MarketData, rep: DataReport, files: List[str], re
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Backtest OTE Fibonacci XAUUSD 15m (HistData M1)")
+    p = argparse.ArgumentParser(description=f"Backtest OTE Fibonacci XAUUSD {TF_LABEL} con trend {TREND_LABEL} (HistData M1)")
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="cartella dei dati (default: %(default)s)")
     p.add_argument("--name", default=DEFAULT_NAME, help="nome del file unico senza estensione (default: %(default)s)")
     p.add_argument("--tz", type=float, default=DEFAULT_TZ,
@@ -1418,9 +1433,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     log_path = setup_logging(args.out)
-    log.info("Backtest OTE Fibonacci %s 15m — parametri della strategia fissi (strategy.py), nessuna ottimizzazione", SYMBOL)
+    log.info("Backtest OTE Fibonacci %s " + TF_LABEL + " (trend EMA " + TREND_LABEL + ") — parametri della strategia fissi (strategy.py), nessuna ottimizzazione", SYMBOL)
     log.info("Parametri: %s", {k: getattr(st, k) for k in [
-        "PIVOT_LEFT", "PIVOT_RIGHT", "ATR_PERIOD", "MIN_RANGE_ATR", "OTE_LOW", "OTE_HIGH", "ENTRY_LEVEL", "TP_LEVEL",
+        "TIMEFRAME_MINUTES", "TREND_TIMEFRAME_MINUTES", "WARMUP_TREND_CANDLES", "PIVOT_LEFT", "PIVOT_RIGHT", "ATR_PERIOD", "MIN_RANGE_ATR", "OTE_LOW", "OTE_HIGH", "ENTRY_LEVEL", "TP_LEVEL",
         "EMA_FAST", "EMA_SLOW", "EMA_SEP_MIN_ATR", "MAX_EMA_CROSSES", "SWING_BUFFER", "ORDER_EXPIRY_CANDLES",
         "USE_BODIES", "RISK_PER_TRADE", "WARMUP_CANDLES", "CONTRACT_SIZE_OZ", "MIN_LOT", "LOT_STEP"]})
     log.info("Costi: spread %.2f USD/oz (metà per lato), slippage %.2f USD/oz per lato, commissione %.1f USD/lotto per lato",

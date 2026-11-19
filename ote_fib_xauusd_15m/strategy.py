@@ -1,5 +1,8 @@
 """
-Strategia OTE (Optimal Trade Entry) su Fibonacci per XAUUSD, timeframe 15 minuti.
+Strategia OTE (Optimal Trade Entry) su Fibonacci per XAUUSD, multi-timeframe:
+- swing pivot, dealing range ed ingresso su candele M5 (TIMEFRAME_MINUTES = 5);
+- filtro di trend con EMA 50 / EMA 100 calcolate su candele H1 (TREND_TIMEFRAME_MINUTES = 60), che la
+  strategia costruisce da sola, in modo causale, aggregando le candele M5 chiuse.
 
 Questo file contiene TUTTA la logica di trading e nient'altro. È lo stesso identico codice usato
 dal backtest (backtest.py) e da un eventuale loop live: non importa nulla del backtest, non accede
@@ -10,22 +13,25 @@ Logica (versione causale dell'indicatore TradingView "OTE visible chart" di @twi
   visibile" diventa l'ULTIMO DEALING RANGE CAUSALE, definito da swing pivot confermati
   (PIVOT_LEFT/PIVOT_RIGHT) e da uno zigzag con alternanza obbligatoria;
 - un pivot sulla candela i è noto solo alla chiusura della candela i + PIVOT_RIGHT (75 minuti dopo);
-- filtro di trend EMA 50 / EMA 100: con trend rialzista solo OTE long, con trend ribassista solo
-  OTE short; in più le EMA devono essere separate (>= EMA_SEP_MIN_ATR x ATR) nella direzione del
-  range per almeno una candela dello swing e non devono incrociarsi più di MAX_EMA_CROSSES volte;
+- filtro di trend EMA 50 / EMA 100 su H1: con trend rialzista solo OTE long, con trend ribassista solo
+  OTE short; in più le EMA H1 devono essere separate (>= EMA_SEP_MIN_ATR x ATR H1) nella direzione del
+  range per almeno una candela dello swing e non devono incrociarsi più di MAX_EMA_CROSSES volte.
+  Una candela H1 è considerata chiusa alla chiusura della candela M5 delle :55 oppure, se quella manca
+  (buco), all'arrivo della prima candela M5 di un'ora successiva: le EMA H1 non usano mai dati futuri;
 - filtri del range: BOS, ampiezza minima in ATR, livello di ingresso non ancora toccato;
 - ingresso SOLO con ordine limite al livello 0.705 (sweet spot della zona OTE 0.618-0.786),
   stop loss all'origine dell'impulso (livello 1.0), take profit all'estremo dell'impulso (0.0);
 - l'ordine pendente si cancella per NUOVO_ESTREMO, SCADUTO, SOSTITUITO o TREND_EMA_INVERTITO;
 - la strategia non emette MAI azioni di chiusura: le uscite sono solo SL e TP lato esecuzione.
 
-La strategia riceve candele 15m CHIUSE una alla volta (on_candle_close) ed emette una lista di
+La strategia riceve candele M5 CHIUSE una alla volta (on_candle_close) ed emette una lista di
 Action (PLACE_LIMIT / CANCEL) valide dall'apertura della candela successiva. Tutti gli indicatori
 sono incrementali con buffer a lunghezza fissa.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,7 +40,8 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 # ---------------------------------------------------------------------------
 # Parametri (FISSI: non vanno ottimizzati)
 # ---------------------------------------------------------------------------
-TIMEFRAME_MINUTES = 15          # timeframe delle candele alimentate alla strategia
+TIMEFRAME_MINUTES = 5           # timeframe delle candele alimentate alla strategia (swing ed entry)
+TREND_TIMEFRAME_MINUTES = 60    # timeframe delle EMA di trend (H1), aggregato dalla strategia
 PIVOT_LEFT = 5
 PIVOT_RIGHT = 5
 ATR_PERIOD = 14
@@ -53,7 +60,8 @@ SWING_BUFFER = 5000
 ORDER_EXPIRY_CANDLES = 48
 USE_BODIES = False
 RISK_PER_TRADE = 0.01
-WARMUP_CANDLES = 500
+WARMUP_CANDLES = 500            # candele M5
+WARMUP_TREND_CANDLES = 200      # candele H1 chiuse (EMA 100 seminata a 100 + 100 di assestamento)
 CONTRACT_SIZE_OZ = 100
 MIN_LOT = 0.01
 LOT_STEP = 0.01
@@ -104,7 +112,7 @@ PIVOT_LOW = "L"
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Candle:
-    """Candela 15m CHIUSA. `time` è l'orario di apertura in UTC (qualunque tipo confrontabile)."""
+    """Candela M5 CHIUSA. `time` = orario di apertura in UTC (datetime o pandas.Timestamp, con fuso UTC)."""
     time: Any
     open: float
     high: float
@@ -434,16 +442,19 @@ class OteFibStrategy:
     """
 
     def __init__(self) -> None:
-        self.atr = WilderATR(ATR_PERIOD)
-        self.ema_fast = EMA(EMA_FAST)
-        self.ema_slow = EMA(EMA_SLOW)
+        self.atr = WilderATR(ATR_PERIOD)              # ATR M5: ampiezza del range
+        self.atr_trend = WilderATR(ATR_PERIOD)        # ATR H1: separazione delle EMA H1
+        self.ema_fast = EMA(EMA_FAST)                 # EMA 50 H1
+        self.ema_slow = EMA(EMA_SLOW)                 # EMA 100 H1
+        self.trend_candles = 0                        # candele H1 chiuse
+        self._h1: Optional[List[Any]] = None          # candela H1 in costruzione: [inizio, o, h, l, c]
         self.index = -1                                   # indice dell'ultima candela alimentata
         self.last_time: Any = None
         self._window: Deque[Tuple[float, float, float, float, int, Any]] = deque(
             maxlen=PIVOT_LEFT + PIVOT_RIGHT + 1)
         # buffer per candela: gap EMA, ATR, high/low reali, orario
-        self._buf_gap = RingBuffer(SWING_BUFFER)
-        self._buf_atr = RingBuffer(SWING_BUFFER)
+        self._buf_gap = RingBuffer(SWING_BUFFER)      # gap EMA H1 valido alla chiusura di ogni M5
+        self._buf_atr = RingBuffer(SWING_BUFFER)      # ATR H1 valido alla chiusura di ogni M5
         self._buf_high = RingBuffer(SWING_BUFFER)
         self._buf_low = RingBuffer(SWING_BUFFER)
         self._buf_time = RingBuffer(SWING_BUFFER)
@@ -466,12 +477,12 @@ class OteFibStrategy:
 
     @property
     def in_warmup(self) -> bool:
-        """True finché non sono state alimentate più di WARMUP_CANDLES candele."""
-        return self.index < WARMUP_CANDLES
+        """True finché non ci sono più di WARMUP_CANDLES candele M5 e almeno WARMUP_TREND_CANDLES candele H1 chiuse."""
+        return self.index < WARMUP_CANDLES or self.trend_candles < WARMUP_TREND_CANDLES
 
     # ------------------------------------------------------------------ interfaccia
     def warmup(self, candles: Iterable[Candle]) -> None:
-        """Aggiorna ATR, EMA, pivot e zigzag senza generare ordini né valutare range."""
+        """Aggiorna ATR, EMA H1, pivot e zigzag senza generare ordini né valutare range."""
         for c in candles:
             self._update_structure(c, evaluate=False)
         self.legs_this_candle = []
@@ -480,12 +491,12 @@ class OteFibStrategy:
     def on_candle_close(self, candle: Candle, position: Optional[Position],
                         pending_order: Optional[PendingOrder]) -> List[Action]:
         """
-        Elabora una candela 15m chiusa. Aggiorna SEMPRE indicatori, pivot e zigzag.
+        Elabora una candela M5 chiusa. Aggiorna SEMPRE indicatori, pivot e zigzag.
         Restituisce le Action attive dall'apertura della candela successiva.
         Con una posizione aperta restituisce sempre una lista vuota.
         """
         self.cancels_this_candle = []
-        legs = self._update_structure(candle, evaluate=not self._warmup_after_update())
+        legs = self._update_structure(candle, evaluate=True)
         self.legs_this_candle = legs
         if self.in_warmup:
             return []
@@ -517,12 +528,8 @@ class OteFibStrategy:
         return actions
 
     # ------------------------------------------------------------------ interni
-    def _warmup_after_update(self) -> bool:
-        # la candela che sta per essere alimentata avrà indice self.index + 1
-        return self.index + 1 < WARMUP_CANDLES
-
     def _candles_alive(self, pending: PendingOrder) -> int:
-        """Candele 15m alimentate dal piazzamento (escluso) alla candela corrente (inclusa)."""
+        """Candele M5 alimentate dal piazzamento (escluso) alla candela corrente (inclusa)."""
         placed = self._order_placed_index.get(pending.id)
         if placed is None:
             alive = int(pending.candles_alive) + 1
@@ -553,19 +560,50 @@ class OteFibStrategy:
             range_high_time=leg["range_high_time"], range_low_time=leg["range_low_time"],
         )
 
+    @staticmethod
+    def trend_bucket(t: Any) -> Any:
+        """Inizio della candela H1 che contiene l'orario t (allineata all'ora UTC)."""
+        return t - _dt.timedelta(minutes=t.minute % TREND_TIMEFRAME_MINUTES, seconds=t.second,
+                                 microseconds=t.microsecond)
+
+    def _close_trend_candle(self) -> None:
+        """Chiude la candela H1 in costruzione e aggiorna EMA 50, EMA 100 e ATR H1."""
+        _, o, h, l, c = self._h1
+        self.atr_trend.update(h, l, c)
+        self.ema_fast.update(c)
+        self.ema_slow.update(c)
+        self.trend_candles += 1
+        self._h1 = None
+
+    def _update_trend(self, c: Candle) -> None:
+        """Aggrega la candela M5 nella candela H1 corrente; la chiude quando l'ora è completa."""
+        bucket = self.trend_bucket(c.time)
+        if self._h1 is not None and bucket != self._h1[0]:
+            # la candela delle :55 mancava (buco): l'ora precedente è comunque finita
+            self._close_trend_candle()
+        if self._h1 is None:
+            self._h1 = [bucket, c.open, c.high, c.low, c.close]
+        else:
+            self._h1[2] = max(self._h1[2], c.high)
+            self._h1[3] = min(self._h1[3], c.low)
+            self._h1[4] = c.close
+        if c.time + _dt.timedelta(minutes=TIMEFRAME_MINUTES) >= bucket + _dt.timedelta(minutes=TREND_TIMEFRAME_MINUTES):
+            self._close_trend_candle()
+
     def _update_structure(self, c: Candle, evaluate: bool) -> List[Dict[str, Any]]:
-        """Aggiorna indicatori, buffer, pivot e zigzag; valuta i nuovi range se evaluate=True."""
+        """Aggiorna indicatori, buffer, pivot e zigzag; valuta i nuovi range se evaluate=True e fuori dal warm-up."""
         if self.last_time is not None and not (c.time > self.last_time):
             raise ValueError(f"candela non in ordine cronologico: {c.time} dopo {self.last_time}")
         self.last_time = c.time
         self.index += 1
         i = self.index
-        atr = self.atr.update(c.high, c.low, c.close)
-        ef = self.ema_fast.update(c.close)
-        es = self.ema_slow.update(c.close)
+        self.atr.update(c.high, c.low, c.close)
+        self._update_trend(c)
+        ef, es = self.ema_fast.value, self.ema_slow.value
         gap = (ef - es) if (ef is not None and es is not None) else None
         self._buf_gap.put(i, gap)
-        self._buf_atr.put(i, atr)
+        self._buf_atr.put(i, self.atr_trend.value)
+        evaluate = evaluate and not self.in_warmup
         self._buf_high.put(i, c.high)
         self._buf_low.put(i, c.low)
         self._buf_time.put(i, c.time)
@@ -672,7 +710,7 @@ class OteFibStrategy:
             "confirm_index": i, "confirm_time": self.last_time, "side": side,
             "range_high": rh, "range_high_time": hi.time, "range_high_index": hi.index,
             "range_low": rl, "range_low_time": lo.time, "range_low_index": lo.index,
-            "prev_extreme": prev_extreme, "atr": atr_conf,
+            "prev_extreme": prev_extreme, "atr": atr_conf, "atr_trend": self.atr_trend.value,
             "amplitude_atr": (rh - rl) / atr_conf if atr_conf else float("nan"),
             "ema_fast": ef, "ema_slow": es,
             "level_618": lv618, "level_705": lv705, "level_786": lv786,

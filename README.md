@@ -4,7 +4,7 @@
 |---|---|
 | [`supertrend_ema_btc_15m/`](supertrend_ema_btc_15m/) | strategia (testata su dati XAUUSD HistData) (`strategy.py`), backtest (`backtest.py`), test (`test_strategy.py`), README con i comandi Windows e l'uso in live |
 | [`docs/LOG_SVILUPPO.md`](docs/LOG_SVILUPPO.md) | decisioni, assunzioni e stato della verifica |
-| [`ote_fib_xauusd_15m/`](ote_fib_xauusd_15m/) | strategia OTE Fibonacci (limite 0.705, filtro EMA 50/100) su XAUUSD 15m: `strategy.py`, `backtest.py`, `test_strategy.py`, README con comandi Windows e uso in live, `LOG_SVILUPPO.md`, `output/` |
+| [`ote_fib_xauusd_15m/`](ote_fib_xauusd_15m/) | strategia OTE Fibonacci (limite 0.705) su XAUUSD: swing ed entry M5, trend EMA 50/100 H1: `strategy.py`, `backtest.py`, `test_strategy.py`, README con comandi Windows e uso in live, `LOG_SVILUPPO.md`, `output/` |
 
 Avvio rapido (Windows, cmd):
 

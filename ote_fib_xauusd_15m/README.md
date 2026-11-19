@@ -1,21 +1,25 @@
-# OTE Fibonacci XAUUSD 15m (filtro EMA 50/100)
+# OTE Fibonacci XAUUSD — entry M5, trend EMA 50/100 H1
 
-Strategia **OTE (Optimal Trade Entry)** sull'oro (XAUUSD), timeframe 15 minuti: ordine limite al
+> Il nome della cartella (`ote_fib_xauusd_15m`) è rimasto quello originale per non rompere i percorsi:
+> la strategia attuale lavora su **M5** (swing ed entry) con trend dalle **EMA 50/100 H1**.
+
+Strategia **OTE (Optimal Trade Entry)** sull'oro (XAUUSD), multi-timeframe: ordine limite al
 livello di Fibonacci **0.705** (dentro la zona OTE 0.618–0.786) dell'ultimo **dealing range causale**
-(swing pivot confermati + zigzag), con filtro di trend **EMA 50 / EMA 100** che decide se cercare solo
-OTE long o solo OTE short. Stop loss all'origine dell'impulso (1.0), take profit all'estremo (0.0):
+(swing pivot confermati + zigzag) su candele **M5**, con filtro di trend **EMA 50 / EMA 100 su H1** che
+decide se cercare solo OTE long o solo OTE short. Le candele H1 le costruisce la strategia stessa
+aggregando le M5 chiuse (nessun dato futuro). Stop loss all'origine dell'impulso (1.0), take profit all'estremo (0.0):
 R teorico 0.705 / 0.295 ≈ 2,39. Rischio 1% per trade. Parametri fissi, nessuna ottimizzazione.
 
 È la versione causale dell'indicatore TradingView "OTE visible chart" (@twingall), che usa massimo e
 minimo del grafico visibile (look-ahead): qui i livelli si calcolano solo con pivot già confermati
-(ritardo di 5 candele = 75 minuti).
+(ritardo di 5 candele M5 = 25 minuti).
 
 ## Struttura
 
 | File | Contenuto |
 |---|---|
-| `strategy.py` | **tutta** la strategia e nient'altro: parametri, ATR, EMA, pivot, zigzag, dealing range e filtri, livelli, limite/SL/TP, scadenza e cancellazioni, sizing. Nessun accesso a file, rete, broker od orologio. Stesso codice in backtest e in live. |
-| `backtest.py` | caricamento e controlli dei dati HistData M1, verifica del fuso, buchi, aggregazione 15m, replay come un loop live, esecuzione dei limiti e di SL/TP sulle candele 1m, costi, metriche, grafici, report |
+| `strategy.py` | **tutta** la strategia e nient'altro: parametri, ATR M5, aggregazione H1 con EMA 50/100 e ATR H1, pivot, zigzag, dealing range e filtri, livelli, limite/SL/TP, scadenza e cancellazioni, sizing. Nessun accesso a file, rete, broker od orologio. Stesso codice in backtest e in live. |
+| `backtest.py` | caricamento e controlli dei dati HistData M1, verifica del fuso, buchi, aggregazione M5, replay come un loop live, esecuzione dei limiti e di SL/TP sulle candele 1m, costi, metriche, grafici, report |
 | `test_strategy.py` | test (senza pytest): riferimento indipendente per indicatori/pivot/zigzag/range, look-ahead, determinismo, sizing, casi limite, formati HistData |
 | `LOG_SVILUPPO.md` | decisioni, assunzioni e stato |
 | `requirements.txt` | dipendenze |
@@ -67,16 +71,19 @@ annotare nel log). Output in `output/`: `report.md`, `metriche.csv`, `trade.csv`
 
 ## Regole principali (dettaglio in `strategy.py`)
 
-- **Pivot** 5/5: swing high se `high[i] > max(5 a sinistra)` e `>= max(5 a destra)` (speculare per i low);
+- **Timeframe**: candele M5 allineate a multipli di 5 minuti UTC; trend su candele H1 allineate all'ora UTC.
+  Una H1 è chiusa alla chiusura della M5 delle :55 (o, se manca per un buco, all'arrivo della prima M5 dell'ora dopo).
+- **Pivot** 5/5 su M5: swing high se `high[i] > max(5 a sinistra)` e `>= max(5 a destra)` (speculare per i low);
   noto solo alla chiusura di `i+5`. Pivot high e low sulla stessa candela: low→high se close ≥ open, altrimenti high→low.
 - **Zigzag** con alternanza obbligatoria (un pivot dello stesso tipo sostituisce l'ultimo solo se più estremo).
 - **Dealing range**: ultimi due punti dello zigzag (L→H rialzista, H→L ribassista). Filtri nell'ordine:
-  trend EMA alla conferma → swing nel buffer → incroci EMA ≤ 1 → EMA separate ≥ 0,5 ATR nella direzione
-  del range in almeno una candela dello swing → BOS → ampiezza ≥ 3 ATR → livello 0.705 non già toccato.
+  trend EMA H1 alla conferma → swing nel buffer → incroci EMA H1 ≤ 1 → EMA H1 separate ≥ 0,5 ATR(14) H1 nella
+  direzione del range in almeno una candela dello swing → BOS → ampiezza ≥ 3 ATR(14) M5 → livello 0.705 non già toccato.
 - **Ingresso**: solo limite a 0.705; nuovo range valido con ordine pendente → `CANCEL SOSTITUITO` + `PLACE_LIMIT`;
   con posizione aperta nessuna Action.
-- **Cancellazione** (decisa a chiusura 15m, effettiva dalla candela successiva): `NUOVO_ESTREMO`,
-  `TREND_EMA_INVERTITO`, `SCADUTO` (48 candele 15m reali).
+- **Cancellazione** (decisa a chiusura M5, effettiva dalla candela successiva): `NUOVO_ESTREMO`,
+  `TREND_EMA_INVERTITO`, `SCADUTO` (48 candele M5 reali = 4 ore di mercato).
+- **Warm-up**: nessun ordine finché non ci sono almeno 500 candele M5 e 200 candele H1 chiuse.
 - **Uscita** solo a SL o TP. La strategia non emette mai chiusure.
 
 ## Uso in live
@@ -88,14 +95,14 @@ ordine reale). Pseudocodice di un loop live (per esempio con MetaTrader 5):
 import strategy as st
 
 s = st.OteFibStrategy()
-storico = carica_ultime_candele_15m_chiuse(n=1000)       # almeno WARMUP_CANDLES = 500, in UTC
+storico = carica_ultime_candele_m5_chiuse(n=3000)        # >= 200 H1 chiuse (2400 M5) e >= 500 M5, in UTC
 s.warmup(storico)                                       # nessun ordine durante il warm-up
 
 pending = None   # st.PendingOrder creato dall'ultimo PLACE_LIMIT ancora attivo sul broker
 position = None  # st.Position se il broker ha una posizione aperta di questa strategia
 
 while True:
-    candle = attendi_chiusura_candela_15m()             # costruita dai tick/barre del broker CONVERTITI IN UTC
+    candle = attendi_chiusura_candela_m5()              # costruita dai tick/barre del broker CONVERTITI IN UTC
     position = leggi_posizione_dal_broker()             # None se flat (SL/TP gestiti dal broker)
     pending = pending if ordine_ancora_attivo(pending) else None
     for a in s.on_candle_close(candle, position, pending):
@@ -116,7 +123,8 @@ while True:
 ```
 
 Note per il live:
-- Converti sempre gli orari del broker in UTC prima di costruire le candele 15m (allineate a :00/:15/:30/:45 UTC);
+- Converti sempre gli orari del broker in UTC prima di costruire le candele M5 (allineate a multipli di 5 minuti UTC);
+  le H1 le costruisce la strategia, non vanno passate a parte;
   le candele mancanti (weekend, pausa) semplicemente non si passano alla strategia.
 - Passa a `on_candle_close` solo candele **chiuse**, in ordine cronologico (la strategia rifiuta candele fuori ordine).
 - Il contatore `candles_alive` dell'ordine lo gestisce la strategia: dopo un riavvio va ricostruito il warm-up

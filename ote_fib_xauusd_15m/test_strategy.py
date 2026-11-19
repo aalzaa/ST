@@ -31,6 +31,7 @@ import backtest as bt  # noqa: E402
 import strategy as st  # noqa: E402
 
 TOL = 1e-6
+TF = st.TIMEFRAME_MINUTES
 NY = "America/New_York"
 
 
@@ -46,7 +47,7 @@ def market_minutes(start: str, end: str) -> pd.DatetimeIndex:
     return idx[open_].as_unit("ns")
 
 
-def synthetic_minutes(start: str = "2023-01-01", end: str = "2023-03-15", seed: int = 7,
+def synthetic_minutes(start: str = "2023-01-01", end: str = "2023-02-25", seed: int = 7,
                       base: float = 1850.0) -> pd.DataFrame:
     """Random walk 1m con regimi di drift (trend alternati) sugli orari reali dell'oro, prezzi > 0."""
     rng = np.random.default_rng(seed)
@@ -80,13 +81,13 @@ def to_histdata_mt(df: pd.DataFrame, tz_hours: float = -5.0) -> str:
 
 
 def candles_from_closes(closes: List[float], wick: float = 0.2, start: str = "2023-01-02 00:00") -> List[st.Candle]:
-    """Candele 15m consecutive: open = close precedente, high/low = max/min + wick."""
+    """Candele consecutive del timeframe della strategia: open = close precedente, high/low = max/min + wick."""
     t0 = pd.Timestamp(start, tz="UTC")
     out = []
     prev = closes[0]
     for i, c in enumerate(closes):
         o = prev
-        out.append(st.Candle(t0 + pd.Timedelta(minutes=15 * i), o, max(o, c) + wick, min(o, c) - wick, c, 0.0))
+        out.append(st.Candle(t0 + pd.Timedelta(minutes=TF * i), o, max(o, c) + wick, min(o, c) - wick, c, 0.0))
         prev = c
     return out
 
@@ -97,17 +98,17 @@ def sine_trend_closes(n: int, slope: float = 0.5, amp: float = 8.0, period: int 
 
 
 def md_from_candles(candles: List[st.Candle]) -> bt.MarketData:
-    """MarketData 1m da candele 15m: 15 candele 1m per candela, interpolazione lineare open -> close."""
+    """MarketData 1m da candele della strategia: TF candele 1m per candela, interpolazione lineare open -> close."""
     rows = []
     for c in candles:
         t0 = pd.Timestamp(c.time).value
-        path = np.linspace(c.open, c.close, 16)
-        for j in range(15):
+        path = np.linspace(c.open, c.close, TF + 1)
+        for j in range(TF):
             o, cl = path[j], path[j + 1]
             h, l = max(o, cl), min(o, cl)
-            if j == 5:
+            if j == 1:
                 h = c.high
-            if j == 9:
+            if j == 3:
                 l = c.low
             rows.append((t0 + j * bt.MINUTE_NS, o, max(h, o, cl), min(l, o, cl), cl))
     df = pd.DataFrame(rows, columns=["time_ns", "open", "high", "low", "close"])
@@ -142,6 +143,39 @@ def ref_ema(c: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
+def ref_trend(times: List[pd.Timestamp], o, h, l, c) -> Dict[str, np.ndarray]:
+    """
+    Riferimento del trend H1: candele H1 dalle candele della strategia (bucket orario UTC). Una H1 vale dalla
+    chiusura della sua ultima candela se questa è quella delle :55, altrimenti dalla candela successiva.
+    Restituisce, per ogni candela della strategia, EMA veloce, EMA lenta, ATR H1 e numero di H1 chiuse.
+    """
+    tns = np.array([pd.Timestamp(t).value for t in times])
+    hour = st.TREND_TIMEFRAME_MINUTES * 60 * 10 ** 9
+    bucket = tns - tns % hour
+    starts = np.r_[0, np.where(np.diff(bucket) != 0)[0] + 1]
+    ends = np.r_[starts[1:], len(tns)] - 1
+    complete = tns[ends] + TF * 60 * 10 ** 9 >= bucket[starts] + hour
+    eff = np.where(complete, ends, ends + 1)        # indice da cui la H1 è nota
+    keep = eff < len(tns)
+    starts, ends, eff = starts[keep], ends[keep], eff[keep]
+    ho = o[starts]
+    hh = np.array([h[a:b + 1].max() for a, b in zip(starts, ends)])
+    hl = np.array([l[a:b + 1].min() for a, b in zip(starts, ends)])
+    hc = c[ends]
+    atr_h, ef_h, es_h = ref_atr(hh, hl, hc), ref_ema(hc, st.EMA_FAST), ref_ema(hc, st.EMA_SLOW)
+    n = len(tns)
+    out = {k: np.full(n, np.nan) for k in ("ef", "es", "atr")}
+    out["count"] = np.zeros(n, dtype=int)
+    j = -1
+    for i in range(n):
+        while j + 1 < len(eff) and eff[j + 1] <= i:
+            j += 1
+        if j >= 0:
+            out["ef"][i], out["es"][i], out["atr"][i] = ef_h[j], es_h[j], atr_h[j]
+            out["count"][i] = j + 1
+    return out
+
+
 def ref_pivots(o, h, l, c) -> List[Tuple[int, str, float, int]]:
     """(indice, tipo, prezzo, candela di conferma), nell'ordine di elaborazione."""
     L, R = st.PIVOT_LEFT, st.PIVOT_RIGHT
@@ -160,10 +194,11 @@ def ref_pivots(o, h, l, c) -> List[Tuple[int, str, float, int]]:
     return out
 
 
-def ref_ranges(o, h, l, c) -> List[Dict]:
+def ref_ranges(times, o, h, l, c) -> List[Dict]:
     """Zigzag + dealing range con esito (strategia sempre flat e senza ordini pendenti)."""
     atr = ref_atr(h, l, c)
-    ef, es = ref_ema(c, st.EMA_FAST), ref_ema(c, st.EMA_SLOW)
+    tr = ref_trend(times, o, h, l, c)
+    ef, es, atr_t = tr["ef"], tr["es"], tr["atr"]
     zz: List[Tuple[int, str, float]] = []
     out = []
     for (i, kind, price, conf) in ref_pivots(o, h, l, c):
@@ -178,7 +213,7 @@ def ref_ranges(o, h, l, c) -> List[Dict]:
         else:
             zz.append((i, kind, price))
             changed = True
-        if not changed or conf < st.WARMUP_CANDLES or len(zz) < 2:
+        if not changed or conf < st.WARMUP_CANDLES or tr["count"][conf] < st.WARMUP_TREND_CANDLES or len(zz) < 2:
             continue
         last, prev = zz[-1], zz[-2]
         before = zz[-3] if len(zz) >= 3 else None
@@ -190,7 +225,7 @@ def ref_ranges(o, h, l, c) -> List[Dict]:
         a, b = (lo_pt[0], hi_pt[0]) if bull else (hi_pt[0], lo_pt[0])
         in_buf = a >= conf - st.SWING_BUFFER + 1
         gap = ef[a:b + 1] - es[a:b + 1]
-        sw_atr = atr[a:b + 1]
+        sw_atr = atr_t[a:b + 1]
         # incroci: segni non nulli consecutivi diversi (gap = 0 o NaN non ha segno)
         signs = np.sign(np.nan_to_num(gap, nan=0.0))
         nz = signs[signs != 0]
@@ -238,6 +273,10 @@ def run_strategy_flat(candles: List[st.Candle]) -> Tuple[st.OteFibStrategy, List
     return s, legs, pivots
 
 
+def times_of(candles: List[st.Candle]) -> List[pd.Timestamp]:
+    return [c.time for c in candles]
+
+
 def arrays(candles: List[st.Candle]):
     return (np.array([c.open for c in candles]), np.array([c.high for c in candles]),
             np.array([c.low for c in candles]), np.array([c.close for c in candles]))
@@ -263,27 +302,36 @@ def synthetic_candles() -> List[st.Candle]:
 def test_indicators_vs_reference():
     candles = synthetic_candles()
     o, h, l, c = arrays(candles)
-    atr_ref, ef_ref, es_ref = ref_atr(h, l, c), ref_ema(c, st.EMA_FAST), ref_ema(c, st.EMA_SLOW)
+    atr_ref = ref_atr(h, l, c)
+    tr = ref_trend(times_of(candles), o, h, l, c)
+    ef_ref, es_ref, atrt_ref = tr["ef"], tr["es"], tr["atr"]
     s = st.OteFibStrategy()
-    atr_inc, ef_inc, es_inc, trend_inc = [], [], [], []
+    atr_inc, ef_inc, es_inc, atrt_inc, trend_inc, cnt_inc = [], [], [], [], [], []
+    nz = lambda v: np.nan if v is None else v
     for cd in candles:
         s.on_candle_close(cd, None, None)
-        atr_inc.append(np.nan if s.atr.value is None else s.atr.value)
-        ef_inc.append(np.nan if s.ema_fast.value is None else s.ema_fast.value)
-        es_inc.append(np.nan if s.ema_slow.value is None else s.ema_slow.value)
+        atr_inc.append(nz(s.atr.value))
+        ef_inc.append(nz(s.ema_fast.value))
+        es_inc.append(nz(s.ema_slow.value))
+        atrt_inc.append(nz(s.atr_trend.value))
         trend_inc.append(s.trend)
-    atr_inc, ef_inc, es_inc = map(np.array, (atr_inc, ef_inc, es_inc))
-    # disponibilità esatta dal seed
+        cnt_inc.append(s.trend_candles)
+    atr_inc, ef_inc, es_inc, atrt_inc = map(np.array, (atr_inc, ef_inc, es_inc, atrt_inc))
+    # disponibilità esatta dal seed (stesse candele NaN del riferimento)
     assert np.isnan(atr_inc[st.ATR_PERIOD - 2]) and not np.isnan(atr_inc[st.ATR_PERIOD - 1])
-    assert np.isnan(es_inc[st.EMA_SLOW - 2]) and not np.isnan(es_inc[st.EMA_SLOW - 1])
-    w = st.WARMUP_CANDLES
+    for a, b in [(ef_inc, ef_ref), (es_inc, es_ref), (atrt_inc, atrt_ref)]:
+        assert (np.isnan(a) == np.isnan(b)).all()
+    assert (np.array(cnt_inc) == tr["count"]).all(), "numero di candele H1 chiuse diverso dal riferimento"
+    w = int(np.argmax(tr["count"] >= st.WARMUP_TREND_CANDLES))
+    w = max(w, st.WARMUP_CANDLES)
     assert np.max(np.abs(atr_inc[w:] - atr_ref[w:])) < TOL
     assert np.max(np.abs(ef_inc[w:] - ef_ref[w:])) < TOL
     assert np.max(np.abs(es_inc[w:] - es_ref[w:])) < TOL
+    assert np.max(np.abs(atrt_inc[w:] - atrt_ref[w:])) < TOL
     assert np.max(np.abs(atr_inc[st.ATR_PERIOD - 1:] - atr_ref[st.ATR_PERIOD - 1:])) < TOL
     trend_ref = np.where(np.isfinite(ef_ref) & np.isfinite(es_ref), np.sign(ef_ref - es_ref), 0).astype(int)
     assert (np.array(trend_inc) == trend_ref).all(), "segno del trend EMA diverso dal riferimento"
-    print(f"    candele 15m: {len(candles)}; trend rialzista {int((trend_ref == 1).sum())}, "
+    print(f"    candele M{TF}: {len(candles)}, H1 chiuse: {cnt_inc[-1]}; fine warm-up alla candela {w}; trend rialzista {int((trend_ref == 1).sum())}, "
           f"ribassista {int((trend_ref == -1).sum())}")
 
 
@@ -302,7 +350,7 @@ def test_ranges_vs_reference():
     candles = synthetic_candles()
     o, h, l, c = arrays(candles)
     _, legs, _ = run_strategy_flat(candles)
-    ref = ref_ranges(o, h, l, c)
+    ref = ref_ranges(times_of(candles), o, h, l, c)
     assert len(legs) == len(ref) and len(ref) > 50, (len(legs), len(ref))
     for a, b in zip(legs, ref):
         for key in ["confirm_index", "side", "range_high", "range_low", "range_high_index", "range_low_index",
@@ -418,18 +466,39 @@ def test_pivot_known_only_after_confirmation():
     assert all(p.index != 15 for p in s2.zigzag)
 
 
+def test_trend_candle_causal():
+    """La candela H1 si chiude alla chiusura della M5 delle :55; se manca, all'arrivo della prima M5 dell'ora dopo."""
+    t0 = pd.Timestamp("2023-01-02 10:00", tz="UTC")
+    s = st.OteFibStrategy()
+    counts = []
+    for k in range(12):
+        s.on_candle_close(st.Candle(t0 + pd.Timedelta(minutes=TF * k), 100, 101, 99, 100 + k), None, None)
+        counts.append(s.trend_candles)
+    assert counts == [0] * 11 + [1], counts            # chiusa solo con la candela delle 10:55
+    assert s._h1 is None
+    # ora successiva senza la candela delle 11:55 (buco): la H1 si chiude all'arrivo della 12:00
+    t1 = t0 + pd.Timedelta(hours=1)
+    for k in range(11):
+        s.on_candle_close(st.Candle(t1 + pd.Timedelta(minutes=TF * k), 100, 101, 99, 100), None, None)
+    assert s.trend_candles == 1
+    s.on_candle_close(st.Candle(t0 + pd.Timedelta(hours=2, minutes=20), 100, 101, 99, 100), None, None)
+    assert s.trend_candles == 2 and s._h1 is not None and s._h1[0] == t0 + pd.Timedelta(hours=2)
+    # nessun ordine finché le H1 chiuse sono meno di WARMUP_TREND_CANDLES, anche oltre WARMUP_CANDLES M5
+    assert s.in_warmup
+
+
 def test_equal_highs_tie_rule():
     # massimi uguali sulle candele 10 e 12: a destra basta >=, a sinistra serve >
     highs = [100.0] * 25
     highs[10] = highs[12] = 105.0
-    candles = [st.Candle(pd.Timestamp("2023-01-02", tz="UTC") + pd.Timedelta(minutes=15 * i), 99.0, h, 98.0, 99.0)
+    candles = [st.Candle(pd.Timestamp("2023-01-02", tz="UTC") + pd.Timedelta(minutes=TF * i), 99.0, h, 98.0, 99.0)
                for i, h in enumerate(highs)]
     _, _, piv = run_strategy_flat(candles)
     highs_found = [(i, conf) for (i, k, p, conf) in piv if k == "H"]
     assert highs_found == [(10, 15)], highs_found
     # stessa candela swing high e swing low: low -> high se close >= open, altrimenti high -> low
     for o_, c_, expected in [(99.0, 99.5, ["L", "H"]), (99.5, 99.0, ["H", "L"])]:
-        cs = [st.Candle(pd.Timestamp("2023-01-02", tz="UTC") + pd.Timedelta(minutes=15 * i), 99.0, 100.0, 98.0, 99.0)
+        cs = [st.Candle(pd.Timestamp("2023-01-02", tz="UTC") + pd.Timedelta(minutes=TF * i), 99.0, 100.0, 98.0, 99.0)
               for i in range(20)]
         cs[8] = st.Candle(cs[8].time, o_, 110.0, 90.0, c_)
         _, _, pv = run_strategy_flat(cs)
@@ -502,7 +571,10 @@ def test_bos_amplitude_touched_rules():
                              touched=True, **base) == st.SCARTATO_GIA_TOCCATO
 
 
-def warm_trend_candles(n: int = 560) -> List[st.Candle]:
+SCENARIO_N = st.WARMUP_TREND_CANDLES * (st.TREND_TIMEFRAME_MINUTES // TF) + 600
+
+
+def warm_trend_candles(n: int = SCENARIO_N) -> List[st.Candle]:
     return candles_from_closes(sine_trend_closes(n))
 
 
@@ -517,7 +589,7 @@ def first_place(candles: List[st.Candle]) -> Tuple[st.OteFibStrategy, int, st.Ac
 
 
 def test_end_to_end_place_and_gia_toccato():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     s, i, a = first_place(candles)
     assert i >= st.WARMUP_CANDLES and a.side == st.LONG
     assert a.limit_price == st.fib_level(st.LONG, a.range_high, a.range_low, st.ENTRY_LEVEL)
@@ -557,7 +629,7 @@ def drive(candles: List[st.Candle], start_strategy: Optional[st.OteFibStrategy] 
 
 
 def test_cancel_nuovo_estremo():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     _, log = drive(candles)
     placed = {}
     checked = 0
@@ -574,7 +646,7 @@ def test_cancel_nuovo_estremo():
 
 
 def test_cancel_expiry():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     s, i, a = first_place(candles)
     # dopo il piazzamento: prezzo piatto tra limite e massimo (nessun fill, nessun nuovo estremo, nessun pivot)
     flat = (a.limit_price + a.range_high) / 2
@@ -582,7 +654,7 @@ def test_cancel_expiry():
     pend = st.PendingOrder(a.id, a.side, a.limit_price, a.sl, a.tp, t0, 0, a.range_high, a.range_low)
     got = None
     for k in range(1, 80):
-        c = st.Candle(t0 + pd.Timedelta(minutes=15 * k), flat, flat + 0.1, flat - 0.1, flat)
+        c = st.Candle(t0 + pd.Timedelta(minutes=TF * k), flat, flat + 0.1, flat - 0.1, flat)
         acts = s.on_candle_close(c, None, pend)
         if acts:
             got = (k, acts)
@@ -601,7 +673,7 @@ def test_cancel_trend_inverted():
     assert st.pending_cancel_reason(st.SHORT, 110, 90, c, 100.0, 100.0, 1) == st.TREND_EMA_INVERTITO
     assert st.pending_cancel_reason(st.LONG, 110, 90, c, 101.0, 100.0, 1) is None
     # nella strategia: forziamo lo stato delle EMA (white-box) dopo un piazzamento
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     s, i, a = first_place(candles)
     pend = st.PendingOrder(a.id, a.side, a.limit_price, a.sl, a.tp, candles[i].time, 0, a.range_high, a.range_low)
     s.ema_fast.value = s.ema_slow.value - 50.0
@@ -616,7 +688,7 @@ def test_cancel_trend_inverted():
 
 
 def test_replace_and_position_open():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     # range valido con un ordine pendente (di un range precedente) -> CANCEL SOSTITUITO + PLACE_LIMIT
     s, i, a = first_place(candles)
     s_ref = st.OteFibStrategy()
@@ -645,7 +717,7 @@ def test_never_close_actions():
     res = bt.run_replay(md, record_actions=True, verbose=False)
     types = {a.type for _, acts in res.actions_log for a in acts}
     assert types <= {st.PLACE_LIMIT, st.CANCEL}, types
-    _, log = drive(warm_trend_candles(700))
+    _, log = drive(warm_trend_candles())
     assert {a.type for _, acts in log for a in acts} <= {st.PLACE_LIMIT, st.CANCEL}
 
 
@@ -654,7 +726,7 @@ def test_never_close_actions():
 # ---------------------------------------------------------------------------
 def _scenario_md(modify: Callable[[pd.DataFrame, int, st.Action], None]) -> Tuple[bt.ReplayResult, int, st.Action, bt.MarketData]:
     """Scenario a trend regolare: modifica le candele 1m della candela successiva al primo piazzamento."""
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     md0 = md_from_candles(candles)
     res0 = bt.run_replay(md0, record_actions=True, verbose=False)
     k, acts = next((k, a) for k, a in res0.actions_log if any(x.type == st.PLACE_LIMIT for x in a))
@@ -666,28 +738,28 @@ def _scenario_md(modify: Callable[[pd.DataFrame, int, st.Action], None]) -> Tupl
 
 
 def _set_next_candle(df: pd.DataFrame, k: int, a: st.Action, md0_start: int, price: float) -> None:
-    rows = slice(md0_start, md0_start + 15)
+    rows = slice(md0_start, md0_start + TF)
     df.loc[df.index[rows], ["open", "high", "low", "close"]] = price
 
 
 def test_fill_strict_and_same_bar_sl():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     md0 = md_from_candles(candles)
 
     def make(low_offset: Optional[float], sl_hit: bool = False):
         def modify(df, k, a):
             start = int(md0.start[k + 1])
             above = a.limit_price + 1.0
-            df.loc[start:start + 14, ["open", "high", "low", "close"]] = above
+            df.loc[start:start + TF - 1, ["open", "high", "low", "close"]] = above
             if low_offset is not None:
-                df.loc[start + 5, "low"] = a.limit_price + low_offset if not sl_hit else a.sl - 0.5
+                df.loc[start + 2, "low"] = a.limit_price + low_offset if not sl_hit else a.sl - 0.5
                 if sl_hit:
-                    df.loc[start + 5, "high"] = a.tp + 5.0   # anche il TP "toccato": ignorato sulla candela del fill
+                    df.loc[start + 2, "high"] = a.tp + 5.0   # anche il TP "toccato": ignorato sulla candela del fill
         return modify
 
     # low == limite: nessun fill
     res, k, a, md = _scenario_md(make(0.0))
-    t_bar = int(md0.t1[int(md0.start[k + 1]) + 5])
+    t_bar = int(md0.t1[int(md0.start[k + 1]) + 2])
     assert not any(pd.Timestamp(x).value == t_bar for x in res.trades.get("fill_time", []))
     assert res.orders.set_index("order_id").loc[a.id, "outcome"] != bt.ORDER_FILLED or \
         res.trades.set_index("order_id").loc[a.id, "fill_time"].value != t_bar
@@ -704,15 +776,15 @@ def test_fill_strict_and_same_bar_sl():
 
 
 def test_gap_fill_and_exit_at_open():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     md0 = md_from_candles(candles)
 
     def modify(df, k, a):
         start = int(md0.start[k + 1])
         gap_open = a.limit_price - 0.5 * (a.limit_price - a.sl)    # apre già sotto il limite (ma sopra lo SL)
-        df.loc[start:start + 14, ["open", "high", "low", "close"]] = gap_open
+        df.loc[start:start + TF - 1, ["open", "high", "low", "close"]] = gap_open
         nxt = int(md0.start[k + 2])
-        df.loc[nxt:nxt + 14, ["open", "high", "low", "close"]] = a.sl - 3.0   # apre sotto lo SL -> uscita all'open
+        df.loc[nxt:nxt + TF - 1, ["open", "high", "low", "close"]] = a.sl - 3.0   # apre sotto lo SL -> uscita all'open
     res, k, a, md = _scenario_md(modify)
     tr = res.trades.set_index("order_id").loc[a.id]
     assert tr["fill_at_open"] and tr["fill_price"] == a.limit_price - 0.5 * (a.limit_price - a.sl)
@@ -720,22 +792,22 @@ def test_gap_fill_and_exit_at_open():
 
     def modify_skip(df, k, a):
         start = int(md0.start[k + 1])
-        df.loc[start:start + 14, ["open", "high", "low", "close"]] = a.sl - 1.0   # gap oltre lo SL
+        df.loc[start:start + TF - 1, ["open", "high", "low", "close"]] = a.sl - 1.0   # gap oltre lo SL
     res, k, a, md = _scenario_md(modify_skip)
     assert res.orders.set_index("order_id").loc[a.id, "outcome"] == st.SKIP_SL_DISTANCE
     assert a.id not in set(res.trades.get("order_id", []))
 
 
 def test_costs_and_pnl():
-    candles = warm_trend_candles(700)
+    candles = warm_trend_candles()
     md0 = md_from_candles(candles)
 
     def modify(df, k, a):
         start = int(md0.start[k + 1])
-        df.loc[start:start + 14, ["open", "high", "low", "close"]] = a.limit_price + 1.0
-        df.loc[start + 5, "low"] = a.limit_price - 0.01
+        df.loc[start:start + TF - 1, ["open", "high", "low", "close"]] = a.limit_price + 1.0
+        df.loc[start + 2, "low"] = a.limit_price - 0.01
         nxt = int(md0.start[k + 2])
-        df.loc[nxt:nxt + 14, ["open", "high", "low", "close"]] = a.limit_price + 1.0
+        df.loc[nxt:nxt + TF - 1, ["open", "high", "low", "close"]] = a.limit_price + 1.0
         df.loc[nxt + 3, "high"] = a.tp + 0.01
     res, k, a, md = _scenario_md(modify)
     tr = res.trades.set_index("order_id").loc[a.id]
@@ -809,17 +881,17 @@ def test_histdata_loading_and_gaps():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_aggregation_15m():
+def test_aggregation_tf():
     df = synthetic_minutes("2023-01-01", "2023-01-10", seed=5)
     df = df.drop(index=[100, 101]).reset_index(drop=True)   # due candele base mancanti
     md = bt.build_market_data(df)
     t = pd.to_datetime(df["time_ns"], utc=True)
-    b = t.dt.floor("15min")
+    b = t.dt.floor(f"{TF}min")
     g = df.groupby(b.to_numpy())
     assert np.array_equal(md.t15, np.array([x.value for x in pd.to_datetime(list(g.groups.keys()), utc=True)]))
     assert np.allclose(md.o15, g["open"].first().to_numpy()) and np.allclose(md.c15, g["close"].last().to_numpy())
     assert np.allclose(md.h15, g["high"].max().to_numpy()) and np.allclose(md.l15, g["low"].min().to_numpy())
-    assert (md.t15 % bt.TF_NS == 0).all() and (md.n_base < 15).sum() >= 1
+    assert (md.t15 % bt.TF_NS == 0).all() and (md.n_base < TF).sum() >= 1
 
 
 # ---------------------------------------------------------------------------
