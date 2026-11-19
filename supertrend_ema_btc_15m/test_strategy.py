@@ -396,7 +396,8 @@ def test_data_checks_and_resample():
     assert all(pd.Timestamp(c.time).value % (bt.TF * bt.MINUTE_NS) == 0 for c in md.candles)
     assert int((md.c_minutes < bt.TF).sum()) == 1
     c0 = md.candles[0]
-    first15 = df.iloc[:bt.TF].drop(index=range(100, 103))
+    first15 = df.iloc[:bt.TF]
+    first15 = first15[~first15.index.isin(range(100, 103))]
     assert c0.open == first15["open"].iloc[0] and c0.close == first15["close"].iloc[-1]
     assert c0.high == first15["high"].max() and c0.low == first15["low"].min()
     # limite temporale

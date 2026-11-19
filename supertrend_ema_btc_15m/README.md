@@ -1,6 +1,6 @@
-# Supertrend + EMA 50/100 — timeframe 2h, RR 3 (dati attuali: XAUUSD)
+# Supertrend + EMA 50/100 — timeframe 30m, RR 3 (dati attuali: XAUUSD)
 
-Strategia (timeframe **2 ore**, `TIMEFRAME_MINUTES = 120` in `strategy.py`), nata per BTC 15m e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
+Strategia (timeframe **30 minuti**, `TIMEFRAME_MINUTES = 30` in `strategy.py`), nata per BTC 15m e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
 (ATR 10, moltiplicatore 3) e filtro di trend EMA 50/100. Uscite solo per stop loss
 (linea del Supertrend sulla candela di cambio, fisso) o take profit (**3R**, fisso).
 Nota: la cartella mantiene il nome storico `supertrend_ema_btc_15m` per non rompere i percorsi.
@@ -106,13 +106,13 @@ import strategy as st
 
 strat = st.SupertrendEmaStrategy()
 
-# 1) warm-up: almeno le ultime WARMUP_CANDLES (500) candele 2h CHIUSE, dalla più vecchia
-history = exchange.fetch_closed_candles(timeframe="2h", limit=1000)        # Candle(time UTC, o, h, l, c, v)
+# 1) warm-up: almeno le ultime WARMUP_CANDLES (500) candele 30m CHIUSE, dalla più vecchia
+history = exchange.fetch_closed_candles(timeframe="30m", limit=1000)        # Candle(time UTC, o, h, l, c, v)
 strat.warmup(history)                                          # nessun segnale qui
 
-# 2) a ogni chiusura di candela 2h (solo candele chiuse, mai quella in formazione)
+# 2) a ogni chiusura di candela 30m (solo candele chiuse, mai quella in formazione)
 while True:
-    candle = wait_for_next_closed_2h_candle()                 # Candle chiusa
+    candle = wait_for_next_closed_30m_candle()                 # Candle chiusa
     position = exchange.current_position()                     # Position(...) oppure None
     actions = strat.on_candle_close(candle, position)          # aggiorna SEMPRE gli indicatori
 
@@ -131,7 +131,7 @@ while True:
 
 Note per il live:
 - se il loop riparte, rifare il warm-up con lo storico prima di operare;
-- le candele 2h vanno allineate come nel backtest (00:00, 02:00, ... UTC);
+- le candele 30m vanno allineate come nel backtest (:00 e :30 UTC);
 - una candela mancante (exchange fermo) non va inventata: semplicemente non viene passata;
 - la quantità in pratica va calcolata prima dell'ordine (su un prezzo stimato) e poi verificata
   sul fill; il TP va ricalcolato sul prezzo effettivo con `take_profit`.

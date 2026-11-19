@@ -95,3 +95,13 @@ di performance sono sintetici e privi di significato.
   i risultati della nuova versione vanno considerati in-sample; servono dati mai visti (es. 2025) per validarla.
 - Test aggiornati (TP calcolato con `st.RR`, dati sintetici più lunghi per il timeframe 2h): 14/14 superati.
 - Cartella non rinominata (`supertrend_ema_btc_15m`) per non rompere i percorsi già usati dall'utente.
+
+## Aggiornamento: timeframe 30m (richiesta esplicita dell'utente)
+
+- `TIMEFRAME_MINUTES = 30` (prima 120); `RR = 3.0` invariato; altri parametri invariati.
+- Candele 30m allineate a :00 e :30 UTC. Warm-up 500 candele 30m ≈ 2 settimane di mercato.
+- Corretto un test (aggregazione) che assumeva che il buco sintetico cadesse nella prima candela: ora è
+  indipendente dal timeframe. 14/14 test superati.
+- **Nota metodologica**: è la terza combinazione timeframe/RR (15m/RR2 → 2h/RR3 → 30m/RR3). Provare più varianti
+  sugli stessi dati 2023-2024 e scegliere la migliore è ottimizzazione manuale: il risultato della variante scelta
+  è in-sample e va validato su dati mai visti (es. 2025) o in paper trading prima di qualsiasi uso reale.
