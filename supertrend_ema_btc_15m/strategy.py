@@ -1,5 +1,5 @@
 """
-Strategia Supertrend (entry) + filtro di trend EMA 50/100, timeframe TIMEFRAME_MINUTES (30 minuti).
+Strategia Supertrend (entry) + filtro di trend EMA 50/100, timeframe TIMEFRAME_MINUTES (1 ora).
 
 Questo file contiene TUTTA e SOLO la logica di trading. È lo stesso identico codice
 usato dal backtest (backtest.py) e da un eventuale loop live:
@@ -23,7 +23,7 @@ from typing import Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Parametri (fissi, NON ottimizzati)
 # ---------------------------------------------------------------------------
-TIMEFRAME_MINUTES = 30   # timeframe delle candele passate alla strategia (30 minuti)
+TIMEFRAME_MINUTES = 60   # timeframe delle candele passate alla strategia (1 ora)
 ST_ATR_PERIOD = 10        # periodo ATR (RMA di Wilder) del Supertrend
 ST_MULTIPLIER = 3.0       # moltiplicatore delle bande del Supertrend
 EMA_FAST = 50             # EMA veloce (filtro di trend)

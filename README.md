@@ -1,4 +1,4 @@
-# ST — Strategia Supertrend + EMA (timeframe 30m, RR 3)
+# ST — Strategia Supertrend + EMA (timeframe 1h, RR 3)
 
 | Cartella / file | Contenuto |
 |---|---|

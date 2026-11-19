@@ -105,3 +105,10 @@ di performance sono sintetici e privi di significato.
 - **Nota metodologica**: è la terza combinazione timeframe/RR (15m/RR2 → 2h/RR3 → 30m/RR3). Provare più varianti
   sugli stessi dati 2023-2024 e scegliere la migliore è ottimizzazione manuale: il risultato della variante scelta
   è in-sample e va validato su dati mai visti (es. 2025) o in paper trading prima di qualsiasi uso reale.
+
+## Aggiornamento: timeframe 1h (richiesta esplicita dell'utente)
+
+- `TIMEFRAME_MINUTES = 60` (prima 30); `RR = 3.0` e altri parametri invariati. Candele allineate all'ora piena UTC.
+  Warm-up 500 candele 1h ≈ 1 mese di mercato. 14/14 test superati.
+- **Nota metodologica**: quarta combinazione timeframe/RR sugli stessi dati (15m/RR2, 2h/RR3, 30m/RR3, 1h/RR3).
+  Qualunque variante venga scelta confrontando i risultati è in-sample: validazione obbligatoria su dati mai visti.
