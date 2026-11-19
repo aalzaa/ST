@@ -1,7 +1,7 @@
-# Supertrend + EMA 50/100 — timeframe 1h, RR 3 (dati attuali: XAUUSD)
+# Supertrend + filtro RSI — timeframe 1h, RR 3 (dati attuali: XAUUSD)
 
 Strategia (timeframe **1 ora**, `TIMEFRAME_MINUTES = 60` in `strategy.py`), nata per BTC 15m e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
-(ATR 10, moltiplicatore 3) e filtro di trend EMA 50/100. Uscite solo per stop loss
+(ATR 10, moltiplicatore 3) e filtro RSI 14 (Wilder): LONG solo se RSI > 50, SHORT solo se RSI < 50 sulla candela di cambio. Uscite solo per stop loss
 (linea del Supertrend sulla candela di cambio, fisso) o take profit (**3R**, fisso).
 Nota: la cartella mantiene il nome storico `supertrend_ema_btc_15m` per non rompere i percorsi.
 Parametri fissi, nessuna ottimizzazione.
@@ -104,7 +104,7 @@ live deve usare `strategy.py` così com'è, esattamente come fa il backtest:
 ```python
 import strategy as st
 
-strat = st.SupertrendEmaStrategy()
+strat = st.SupertrendRsiStrategy()
 
 # 1) warm-up: almeno le ultime WARMUP_CANDLES (500) candele 1h CHIUSE, dalla più vecchia
 history = exchange.fetch_closed_candles(timeframe="1h", limit=1000)        # Candle(time UTC, o, h, l, c, v)

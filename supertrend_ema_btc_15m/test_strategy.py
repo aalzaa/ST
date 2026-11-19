@@ -5,7 +5,7 @@ Copertura:
 - nessun look-ahead (strategia alimentata fino alla candela N == run completa alla candela N);
 - indicatori incrementali contro un'implementazione di riferimento indipendente;
 - determinismo del backtest;
-- casi limite su dati sintetici (ombre, EMA uguali/discordi, posizione aperta, niente chiusure);
+- casi limite su dati sintetici (ombre, RSI = soglia / discorde, posizione aperta, niente chiusure);
 - dettagli di esecuzione del backtest (SL e TP nella stessa 1m, uscita all'open dopo un buco).
 """
 
@@ -58,7 +58,7 @@ def make_candle(i: int, o: float, h: float, l: float, c: float) -> st.Candle:
 # ---------------------------------------------------------------------------
 # Implementazione di riferimento indipendente (loop numpy, formule alla lettera)
 # ---------------------------------------------------------------------------
-def reference_indicators(high, low, close, atr_period=10, mult=3.0, fast=50, slow=100):
+def reference_indicators(high, low, close, atr_period=10, mult=3.0, rsi_period=14):
     n = len(close)
     tr = np.empty(n)
     tr[0] = high[0] - low[0]
@@ -90,16 +90,26 @@ def reference_indicators(high, low, close, atr_period=10, mult=3.0, fast=50, slo
                 direction[i] = down if close[i] < lb[i] else up
         stv[i] = lb[i] if direction[i] == up else ub[i]
 
-    def ema(period):
-        out = np.full(n, np.nan)
-        a = 2 / (period + 1)
-        out[period - 1] = close[:period].mean()
-        for i in range(period, n):
-            out[i] = a * close[i] + (1 - a) * out[i - 1]
-        return out
+    # RSI di Wilder: seed = media semplice dei primi N guadagni/perdite, poi RMA
+    diff = np.diff(close)
+    gains = np.where(diff > 0, diff, 0.0)
+    losses = np.where(diff < 0, -diff, 0.0)
+    rsi = np.full(n, np.nan)
+    ag = gains[:rsi_period].mean()
+    al = losses[:rsi_period].mean()
 
-    return {"atr": atr, "upper": ub, "lower": lb, "st": stv, "dir": direction,
-            "ema_fast": ema(fast), "ema_slow": ema(slow)}
+    def to_rsi(g, l_):
+        if l_ == 0:
+            return 50.0 if g == 0 else 100.0
+        return 100 - 100 / (1 + g / l_)
+
+    rsi[rsi_period] = to_rsi(ag, al)
+    for i in range(rsi_period + 1, n):
+        ag = (ag * (rsi_period - 1) + gains[i - 1]) / rsi_period
+        al = (al * (rsi_period - 1) + losses[i - 1]) / rsi_period
+        rsi[i] = to_rsi(ag, al)
+
+    return {"atr": atr, "upper": ub, "lower": lb, "st": stv, "dir": direction, "rsi": rsi}
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +130,9 @@ def test_indicators_match_reference():
     h = np.array([c.high for c in candles])
     l = np.array([c.low for c in candles])
     c = np.array([c.close for c in candles])
-    ref = reference_indicators(h, l, c, st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.EMA_FAST, st.EMA_SLOW)
-    strat = st.SupertrendEmaStrategy()
-    vals = {k: [] for k in ("atr", "st", "upper", "lower", "dir", "ema_fast", "ema_slow")}
+    ref = reference_indicators(h, l, c, st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.RSI_PERIOD)
+    strat = st.SupertrendRsiStrategy()
+    vals = {k: [] for k in ("atr", "st", "upper", "lower", "dir", "rsi")}
     for cd in candles:
         strat.on_candle_close(cd, None)
         s = strat.supertrend
@@ -131,14 +141,13 @@ def test_indicators_match_reference():
         vals["upper"].append(s.upper_band if s.upper_band is not None else np.nan)
         vals["lower"].append(s.lower_band if s.lower_band is not None else np.nan)
         vals["dir"].append(s.direction)
-        vals["ema_fast"].append(strat.ema_fast.value if strat.ema_fast.value is not None else np.nan)
-        vals["ema_slow"].append(strat.ema_slow.value if strat.ema_slow.value is not None else np.nan)
+        vals["rsi"].append(strat.rsi.value if strat.rsi.value is not None else np.nan)
     w = st.WARMUP_CANDLES
-    for k in ("atr", "st", "upper", "lower", "ema_fast", "ema_slow"):
+    for k in ("atr", "st", "upper", "lower", "rsi"):
         diff = np.max(np.abs(np.array(vals[k])[w:] - ref[k][w:]))
         assert diff < 1e-6, f"{k}: differenza massima {diff}"
     # anche prima del warm-up, dove definiti
-    for k in ("atr", "ema_fast", "ema_slow", "st"):
+    for k in ("atr", "rsi", "st"):
         a, b = np.array(vals[k]), ref[k]
         mask = ~np.isnan(b)
         assert np.all(~np.isnan(a[mask])) and np.max(np.abs(a[mask] - b[mask])) < 1e-6, k
@@ -149,16 +158,24 @@ def test_indicators_match_reference():
     return f"3000 candele, {n_changes} cambi di trend, direzione coincidente al 100%"
 
 
-def test_atr_ema_seed_availability():
+def test_atr_rsi_seed_availability():
     atr = st.IncrementalATR(10)
     for i in range(9):
         assert atr.update(10 + i, 9 + i, 9.5 + i) is None
     assert atr.update(20, 18, 19) is not None, "ATR deve essere disponibile dalla 10a candela"
-    ema = st.IncrementalEMA(50)
-    for i in range(49):
-        assert ema.update(float(i)) is None
-    assert abs(ema.update(49.0) - np.mean(np.arange(50))) < 1e-12, "seed EMA = SMA dei primi N"
-    return "seed SMA e disponibilità corretti"
+    rsi = st.IncrementalRSI(14)
+    closes = [10, 11, 10.5, 12, 11, 11.5, 13, 12, 12.5, 14, 13, 13.5, 15, 14, 14.5]
+    for x in closes[:14]:
+        assert rsi.update(float(x)) is None
+    v = rsi.update(float(closes[14]))
+    d = np.diff(closes)
+    exp = 100 - 100 / (1 + d[d > 0].sum() / 14 / (-d[d < 0].sum() / 14))
+    assert v is not None and abs(v - exp) < 1e-12, "RSI: seed = media dei primi 14 guadagni/perdite"
+    flat = st.IncrementalRSI(14)
+    for _ in range(15):
+        val = flat.update(5.0)
+    assert val == 50.0, "RSI con prezzo costante = 50"
+    return "seed SMA e disponibilità di ATR e RSI corretti"
 
 
 def test_no_lookahead():
@@ -172,7 +189,7 @@ def test_no_lookahead():
     samples = sorted(set(entries) | set(others))
     assert len(samples) >= 50
     for N in samples:
-        strat = st.SupertrendEmaStrategy()
+        strat = st.SupertrendRsiStrategy()
         strat.warmup(md.candles[:st.WARMUP_CANDLES])
         acts = []
         for k in range(st.WARMUP_CANDLES, N + 1):
@@ -234,7 +251,7 @@ def test_wick_does_not_flip():
 
 def test_wick_no_signal_in_strategy():
     # strategia completa: un'ombra non produce né segnale né azione
-    strat = st.SupertrendEmaStrategy()
+    strat = st.SupertrendRsiStrategy()
     price = 40000.0
     i = 0
     for i in range(600):
@@ -247,22 +264,28 @@ def test_wick_no_signal_in_strategy():
     return "nessun segnale su ombra"
 
 
-def test_ema_filter_rules():
-    pos = st.Position(side=st.LONG, entry=100.0, sl=90.0, tp=120.0, qty=1.0)
+def test_rsi_filter_rules():
+    pos = st.Position(side=st.LONG, entry=100.0, sl=90.0, tp=130.0, qty=1.0)
     up, dn = st.IS_UP_TREND, st.IS_DOWN_TREND
-    assert st.evaluate_trend_change(up, 95.0, 100.0, 100.0, None) == ([], st.OUTCOME_REJECTED_EMA)
-    assert st.evaluate_trend_change(dn, 105.0, 100.0, 100.0, None) == ([], st.OUTCOME_REJECTED_EMA)
-    assert st.evaluate_trend_change(up, 95.0, 99.0, 100.0, None) == ([], st.OUTCOME_REJECTED_EMA)
-    assert st.evaluate_trend_change(dn, 105.0, 101.0, 100.0, None) == ([], st.OUTCOME_REJECTED_EMA)
-    acts, out = st.evaluate_trend_change(up, 95.0, 101.0, 100.0, None)
+    th = st.RSI_THRESHOLD
+    rej = st.OUTCOME_REJECTED_FILTER
+    # RSI esattamente sulla soglia: nessun ingresso
+    assert st.evaluate_trend_change(up, 95.0, th, None) == ([], rej)
+    assert st.evaluate_trend_change(dn, 105.0, th, None) == ([], rej)
+    # RSI discorde: nessun ingresso
+    assert st.evaluate_trend_change(up, 95.0, th - 1, None) == ([], rej)
+    assert st.evaluate_trend_change(dn, 105.0, th + 1, None) == ([], rej)
+    # RSI non disponibile: nessun ingresso
+    assert st.evaluate_trend_change(up, 95.0, None, None) == ([], rej)
+    # RSI concorde: ingresso con SL sulla linea
+    acts, out = st.evaluate_trend_change(up, 95.0, th + 1, None)
     assert out == st.OUTCOME_ENTRY and acts == [st.Action(side=st.LONG, sl=95.0)]
-    acts, out = st.evaluate_trend_change(dn, 105.0, 99.0, 100.0, None)
+    acts, out = st.evaluate_trend_change(dn, 105.0, th - 1, None)
     assert out == st.OUTCOME_ENTRY and acts == [st.Action(side=st.SHORT, sl=105.0)]
-    # posizione aperta + cambio opposto con EMA concordi: nessuna azione
-    assert st.evaluate_trend_change(dn, 105.0, 99.0, 100.0, pos) == ([], st.OUTCOME_IGNORED_POSITION)
-    assert st.evaluate_trend_change(up, 95.0, 101.0, 100.0, pos) == ([], st.OUTCOME_IGNORED_POSITION)
-    assert st.evaluate_trend_change(up, 95.0, None, 100.0, None) == ([], st.OUTCOME_REJECTED_EMA)
-    return "EMA uguali / discordi / posizione aperta"
+    # posizione aperta + cambio opposto con RSI concorde: nessuna azione
+    assert st.evaluate_trend_change(dn, 105.0, th - 1, pos) == ([], st.OUTCOME_IGNORED_POSITION)
+    assert st.evaluate_trend_change(up, 95.0, th + 1, pos) == ([], st.OUTCOME_IGNORED_POSITION)
+    return "RSI = soglia / discorde / non disponibile / posizione aperta"
 
 
 def test_rules_in_full_replay():
@@ -282,13 +305,13 @@ def test_rules_in_full_replay():
             s = sig_by_time.get(t)
             assert s is not None and s["outcome"] == st.OUTCOME_ENTRY, "ingresso fuori da un cambio di trend"
             a = acts[0]
-            assert (a.side == st.LONG and s["ema_fast"] > s["ema_slow"]) or \
-                   (a.side == st.SHORT and s["ema_fast"] < s["ema_slow"])
+            assert (a.side == st.LONG and s["rsi"] > st.RSI_THRESHOLD) or \
+                   (a.side == st.SHORT and s["rsi"] < st.RSI_THRESHOLD)
             assert a.sl == s["st_line"]
         s = sig_by_time.get(t)
         if s is not None and s["outcome"] == st.OUTCOME_IGNORED_POSITION:
             assert pos is not None
-            if (s["direction"] == st.LONG) == (s["ema_fast"] > s["ema_slow"]) and pos.side != s["direction"]:
+            if (s["direction"] == st.LONG) == (s["rsi"] > st.RSI_THRESHOLD) and pos.side != s["direction"]:
                 ignored_concordant += 1
     for tr in res.trades:
         assert tr["exit_reason"] in ("SL", "TP", "fine_dati")
@@ -298,16 +321,16 @@ def test_rules_in_full_replay():
     except ValueError:
         pass
     # scenario costruito: a ogni candela in cui la strategia flat entrerebbe, si passa una posizione
-    # aperta di verso opposto (cambio opposto con EMA concordi): nessuna Action deve uscire
+    # aperta di verso opposto (cambio opposto con RSI concorde): nessuna Action deve uscire
     candles = md.candles
-    flat = st.SupertrendEmaStrategy()
+    flat = st.SupertrendRsiStrategy()
     entry_idx = [i for i, c in enumerate(candles) if flat.on_candle_close(c, None)]
     assert len(entry_idx) >= 5
     for N in entry_idx[:10]:
-        s2 = st.SupertrendEmaStrategy()
+        s2 = st.SupertrendRsiStrategy()
         for k in range(N):
             s2.on_candle_close(candles[k], None)
-        flat_side = st.SupertrendEmaStrategy()
+        flat_side = st.SupertrendRsiStrategy()
         for k in range(N):
             flat_side.on_candle_close(candles[k], None)
         side = flat_side.on_candle_close(candles[N], None)[0].side
@@ -331,7 +354,7 @@ def test_sizing_and_tp():
 
 
 def test_out_of_order_rejected():
-    strat = st.SupertrendEmaStrategy()
+    strat = st.SupertrendRsiStrategy()
     strat.on_candle_close(make_candle(1, 1, 2, 0.5, 1.5), None)
     try:
         strat.on_candle_close(make_candle(1, 1, 2, 0.5, 1.5), None)
@@ -446,13 +469,13 @@ def test_histdata_format_and_gaps():
 
 
 TESTS = [
-    test_atr_ema_seed_availability,
+    test_atr_rsi_seed_availability,
     test_indicators_match_reference,
     test_no_lookahead,
     test_determinism,
     test_wick_does_not_flip,
     test_wick_no_signal_in_strategy,
-    test_ema_filter_rules,
+    test_rsi_filter_rules,
     test_rules_in_full_replay,
     test_sizing_and_tp,
     test_out_of_order_rejected,

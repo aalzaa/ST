@@ -1,5 +1,5 @@
 """
-Backtest della strategia definita in strategy.py (Supertrend + filtro EMA 50/100).
+Backtest della strategia definita in strategy.py (Supertrend + filtro RSI).
 Il timeframe è definito in strategy.py (TIMEFRAME_MINUTES).
 
 Questo file contiene tutto ciò che NON è logica di trading: caricamento e controllo dei
@@ -579,7 +579,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
     - a fine dati un trade aperto si chiude all'ultimo close 1m ("fine_dati").
     Nessuna regola di trading è definita qui: tutto viene da strategy.py.
     """
-    strategy = st.SupertrendEmaStrategy()
+    strategy = st.SupertrendRsiStrategy()
     n = len(md.candles)
     warm = min(st.WARMUP_CANDLES, n)
     strategy.warmup(md.candles[:warm])
@@ -632,8 +632,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
             "slippage_usd": meta["slip_entry"] + slip_exit,
             "costs_usd": meta["comm_entry"] + comm_exit + meta["slip_entry"] + slip_exit,
             "duration_min": (exit_time_ns - meta["entry_time_ns"]) / MINUTE_NS,
-            "ema_fast_signal": meta["ema_fast"],
-            "ema_slow_signal": meta["ema_slow"],
+            "rsi_signal": meta["rsi"],
             "st_line_signal": meta["st_line"],
             "equity_before": meta["equity_before"],
             "equity_after": cash,
@@ -674,8 +673,8 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
                     "entry_time_ns": int(m_time[s]), "entry_idx": s, "comm_entry": comm_entry,
                     "slip_entry": qty * abs(entry - raw), "risk_usd": qty * abs(entry - pending.sl),
                     "equity_before": equity_before, "leverage": lev,
-                    "signal_time": pending_signal["time"], "ema_fast": pending_signal["ema_fast"],
-                    "ema_slow": pending_signal["ema_slow"], "st_line": pending_signal["st_line"],
+                    "signal_time": pending_signal["time"], "rsi": pending_signal["rsi"],
+                    "st_line": pending_signal["st_line"],
                     "gap_during_trade": False, "ignored": 0,
                 }
                 pending_signal["execution"] = "ESEGUITO"
@@ -730,7 +729,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
         if strategy.signal_on_last_candle:
             sig = strategy.last_signal
             rec = {"time": pd.Timestamp(sig.time), "direction": sig.direction, "st_line": sig.st_line,
-                   "ema_fast": sig.ema_fast, "ema_slow": sig.ema_slow, "outcome": sig.outcome,
+                   "rsi": sig.rsi, "outcome": sig.outcome,
                    "execution": "", "candle_incomplete": bool(md.c_minutes[i] < TF)}
             signals.append(rec)
             if sig.outcome == st.OUTCOME_IGNORED_POSITION and position is not None:
@@ -866,7 +865,7 @@ def compute_metrics(res: ReplayResult, initial_capital: float = INITIAL_CAPITAL)
     sig = pd.DataFrame(res.signals)
     m["cambi_trend_totali"] = len(sig)
     for key, label in [(st.OUTCOME_ENTRY, "cambi_trend_entrati"),
-                       (st.OUTCOME_REJECTED_EMA, "cambi_trend_scartati_ema"),
+                       (st.OUTCOME_REJECTED_FILTER, "cambi_trend_scartati_rsi"),
                        (st.OUTCOME_IGNORED_POSITION, "cambi_trend_ignorati_in_posizione")]:
         m[label] = int((sig["outcome"] == key).sum()) if not sig.empty else 0
     m["trade_saltati_distanza_sl"] = len(res.skipped)
@@ -937,7 +936,7 @@ def plot_equity(res: ReplayResult, path: str, symbol: str = "") -> None:
             ax.spines[sp].set_visible(False)
         for sp in ("left", "bottom"):
             ax.spines[sp].set_color(grid)
-    fig.suptitle(f"Supertrend + EMA 50/100 - {symbol} {TF_LABEL}", x=0.01, ha="left", color=ink, fontsize=13)
+    fig.suptitle(f"Supertrend + RSI {st.RSI_PERIOD} - {symbol} {TF_LABEL}", x=0.01, ha="left", color=ink, fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -1044,7 +1043,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
                  bd: Dict[str, pd.DataFrame], notes: List[str]) -> None:
     tr = pd.DataFrame(res.trades)
     L: List[str] = []
-    L.append(f"# Report backtest - Supertrend + EMA 50/100 su {rep.symbol} {TF_LABEL}\n")
+    L.append(f"# Report backtest - Supertrend + filtro RSI su {rep.symbol} {TF_LABEL}\n")
     L.append("*Report generato automaticamente da `backtest.py`. Backtest eseguito una sola volta, parametri fissi, "
              "nessuna ottimizzazione.*\n")
     L.append("## Dichiarazioni obbligatorie\n")
@@ -1053,9 +1052,9 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
     L.append("")
 
     L.append("## Strategia\n")
-    L.append(f"- Supertrend ATR {st.ST_ATR_PERIOD} (RMA di Wilder), moltiplicatore {st.ST_MULTIPLIER}; filtro EMA "
-             f"{st.EMA_FAST}/{st.EMA_SLOW} sulla chiusura; seed SMA per ATR ed EMA; warm-up {st.WARMUP_CANDLES} candele {TF_LABEL}; timeframe {TF_LABEL} (candele allineate a multipli di {TF_LABEL} dalla mezzanotte UTC).")
-    L.append("- LONG: Supertrend passa a rialzo e EMA50 > EMA100; SHORT: passa a ribasso e EMA50 < EMA100; "
+    L.append(f"- Supertrend ATR {st.ST_ATR_PERIOD} (RMA di Wilder), moltiplicatore {st.ST_MULTIPLIER}; filtro RSI "
+             f"{st.RSI_PERIOD} (Wilder) sulla chiusura con soglia {st.RSI_THRESHOLD:g}; seed SMA per ATR e RSI; warm-up {st.WARMUP_CANDLES} candele {TF_LABEL}; timeframe {TF_LABEL} (candele allineate a multipli di {TF_LABEL} dalla mezzanotte UTC).")
+    L.append(f"- LONG: Supertrend passa a rialzo e RSI > {st.RSI_THRESHOLD:g}; SHORT: passa a ribasso e RSI < {st.RSI_THRESHOLD:g}; "
              "valutato alla chiusura della candela di cambio, ingresso all'open della candela successiva.")
     L.append(f"- SL fisso sulla linea del Supertrend della candela di cambio; TP fisso a {st.RR:g}R dal prezzo di "
              f"ingresso effettivo; rischio {st.RISK_PER_TRADE * 100:.0f}% dell'equity corrente; una posizione alla volta; "
@@ -1111,7 +1110,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
     L.append("## Cambi di trend del Supertrend (dopo il warm-up)\n")
     L.append(f"- Totali: {m['cambi_trend_totali']}")
     L.append(f"- Entrati: {m['cambi_trend_entrati']} (di cui saltati per distanza SL <= 0: {m['trade_saltati_distanza_sl']})")
-    L.append(f"- Scartati perché le EMA non concordano: {m['cambi_trend_scartati_ema']}")
+    L.append(f"- Scartati dal filtro RSI: {m['cambi_trend_scartati_rsi']}")
     L.append(f"- Ignorati perché già in posizione: {m['cambi_trend_ignorati_in_posizione']}\n")
 
     for name, title in [("anno", "Per anno"), ("trimestre", "Per trimestre"), ("lato", "Long vs short"),
@@ -1142,8 +1141,8 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
     L.append("## Punti deboli e rischi\n")
     L.append(f"- Un solo strumento ({rep.symbol}), una sola fonte dati, un solo periodo "
              f"({rep.first_time.year}-{rep.last_time.year}); buy & hold nel periodo = "
-             f"{fmt(m.get('buy_and_hold_pct', float('nan')))}%. In un mercato prevalentemente rialzista il filtro EMA "
-             "favorisce i long, quindi il risultato può riflettere il regime più che un vantaggio della regola.")
+             f"{fmt(m.get('buy_and_hold_pct', float('nan')))}%. In un mercato prevalentemente rialzista il filtro RSI "
+             "(momentum) favorisce i long, quindi il risultato può riflettere il regime più che un vantaggio della regola.")
     if rep.data_format == FORMAT_HISTDATA:
         L.append("- Swap/finanziamento overnight non inclusi; i trade che restano aperti più giorni li pagherebbero in live.")
         L.append("- Gap di riapertura (lunedì, dopo festività): lo SL non protegge al suo livello; il backtest chiude "
@@ -1169,7 +1168,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
 # Main
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=f"Backtest Supertrend + EMA 50/100, timeframe {TF_LABEL}")
+    p = argparse.ArgumentParser(description=f"Backtest Supertrend + filtro RSI, timeframe {TF_LABEL}")
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="cartella dei dati 1m (HistData o Binance)")
     p.add_argument("--name", default=DEFAULT_NAME, help="nome del file unico (senza estensione)")
     p.add_argument("--out", default=DEFAULT_OUT, help="cartella di output")
@@ -1179,9 +1178,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     log_path = setup_logging(args.out)
-    log.info("=== BACKTEST Supertrend + EMA 50/100 (%s) ===", TF_LABEL)
-    log.info("Parametri strategia (fissi): ATR=%d, mult=%.1f, EMA=%d/%d, RR=%.1f, rischio=%.2f%%, warm-up=%d",
-             st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.EMA_FAST, st.EMA_SLOW, st.RR, st.RISK_PER_TRADE * 100,
+    log.info("=== BACKTEST Supertrend + filtro RSI (%s) ===", TF_LABEL)
+    log.info("Parametri strategia (fissi): ATR=%d, mult=%.1f, RSI=%d soglia %.0f, RR=%.1f, rischio=%.2f%%, warm-up=%d",
+             st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.RSI_PERIOD, st.RSI_THRESHOLD, st.RR, st.RISK_PER_TRADE * 100,
              st.WARMUP_CANDLES)
     log.info("Esecuzione: capitale %.0f, commissione %.3f%%/lato, slippage %.3f%%/lato, funding/swap non inclusi",
              INITIAL_CAPITAL, COMMISSION_RATE * 100, SLIPPAGE_RATE * 100)

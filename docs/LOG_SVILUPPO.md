@@ -112,3 +112,22 @@ di performance sono sintetici e privi di significato.
   Warm-up 500 candele 1h ≈ 1 mese di mercato. 14/14 test superati.
 - **Nota metodologica**: quarta combinazione timeframe/RR sugli stessi dati (15m/RR2, 2h/RR3, 30m/RR3, 1h/RR3).
   Qualunque variante venga scelta confrontando i risultati è in-sample: validazione obbligatoria su dati mai visti.
+
+## Aggiornamento: filtro EMA sostituito da filtro RSI, timeframe 1h (richiesta esplicita dell'utente)
+
+- Rimossi `EMA_FAST`/`EMA_SLOW` e la classe EMA; aggiunti `RSI_PERIOD = 14` e `RSI_THRESHOLD = 50.0`.
+- **Regola scelta in autonomia** (l'utente non l'ha specificata): RSI di Wilder a 14 periodi sulla chiusura,
+  valutato sulla candela di cambio del Supertrend. LONG se RSI > 50, SHORT se RSI < 50, nessun ingresso se
+  RSI = 50 o non disponibile. È l'equivalente più diretto del vecchio filtro di trend (momentum concorde).
+- RSI: seed = media semplice dei primi 14 guadagni e delle prime 14 perdite (disponibile dalla 15ª candela),
+  poi RMA di Wilder; con perdita media nulla RSI = 100 (50 se anche il guadagno medio è nullo).
+- Classe rinominata `SupertrendRsiStrategy`; esito di scarto `SCARTATO_RSI`; colonne `rsi` / `rsi_signal` nei CSV;
+  metrica `cambi_trend_scartati_rsi`.
+- Test: RSI di riferimento indipendente (tolleranza 1e-6), regole del filtro (RSI = soglia, discorde, non
+  disponibile, posizione aperta). 14/14 superati.
+- **Osservazione importante**: un cambio di trend del Supertrend richiede una chiusura oltre la banda, cioè un
+  movimento forte nella direzione del cambio, che di solito porta già l'RSI dalla parte giusta di 50. Il filtro
+  RSI > 50 / < 50 scarta quindi pochissimi segnali (prova sintetica: 4 su 317) e la strategia si comporta quasi
+  come il Supertrend da solo. Da verificare sui dati reali nel report (riga "Scartati dal filtro RSI").
+- Nome della cartella invariato (`supertrend_ema_btc_15m`) per non rompere i percorsi.
+- **Nota metodologica**: quinta variante sugli stessi dati 2023-2024; qualunque variante scelta è in-sample.

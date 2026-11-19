@@ -1,5 +1,5 @@
 """
-Strategia Supertrend (entry) + filtro di trend EMA 50/100, timeframe TIMEFRAME_MINUTES (1 ora).
+Strategia Supertrend (entry) + filtro RSI 14 (soglia 50), timeframe TIMEFRAME_MINUTES (1 ora).
 
 Questo file contiene TUTTA e SOLO la logica di trading. È lo stesso identico codice
 usato dal backtest (backtest.py) e da un eventuale loop live:
@@ -26,8 +26,8 @@ from typing import Iterable, List, Optional, Tuple
 TIMEFRAME_MINUTES = 60   # timeframe delle candele passate alla strategia (1 ora)
 ST_ATR_PERIOD = 10        # periodo ATR (RMA di Wilder) del Supertrend
 ST_MULTIPLIER = 3.0       # moltiplicatore delle bande del Supertrend
-EMA_FAST = 50             # EMA veloce (filtro di trend)
-EMA_SLOW = 100            # EMA lenta (filtro di trend)
+RSI_PERIOD = 14           # periodo RSI (smoothing di Wilder) sulla chiusura
+RSI_THRESHOLD = 50.0      # filtro: LONG se RSI > soglia, SHORT se RSI < soglia
 RR = 3.0                  # rapporto rendimento/rischio del take profit
 RISK_PER_TRADE = 0.01     # frazione dell'equity rischiata per trade
 WARMUP_CANDLES = 500      # candele del timeframe senza segnali all'avvio (backtest e live)
@@ -44,7 +44,7 @@ IS_DOWN_TREND = -1
 ACTION_OPEN = "OPEN"
 
 OUTCOME_ENTRY = "ENTRY"
-OUTCOME_REJECTED_EMA = "SCARTATO_EMA"
+OUTCOME_REJECTED_FILTER = "SCARTATO_RSI"
 OUTCOME_IGNORED_POSITION = "IGNORATO_POSIZIONE_APERTA"
 
 
@@ -69,7 +69,7 @@ class Position:
     entry: float   # prezzo di ingresso effettivo
     sl: float      # stop loss fisso
     tp: float      # take profit fisso
-    qty: float     # quantità in BTC
+    qty: float     # quantità in unità del sottostante
 
 
 @dataclass(frozen=True)
@@ -97,35 +97,55 @@ class Signal:
     time: datetime          # orario di apertura della candela di cambio
     direction: str          # LONG (passaggio a isUpTrend) o SHORT (a isDownTrend)
     st_line: float          # linea del Supertrend sulla candela di cambio
-    ema_fast: float
-    ema_slow: float
-    outcome: str            # ENTRY / SCARTATO_EMA / IGNORATO_POSIZIONE_APERTA
+    rsi: Optional[float]    # RSI sulla candela di cambio
+    outcome: str            # ENTRY / SCARTATO_RSI / IGNORATO_POSIZIONE_APERTA
 
 
 # ---------------------------------------------------------------------------
 # Indicatori incrementali
 # ---------------------------------------------------------------------------
-class IncrementalEMA:
+class IncrementalRSI:
     """
-    EMA sulla chiusura, alpha = 2 / (N + 1).
-    Seed esplicito: SMA dei primi N valori; disponibile dall'N-esimo valore.
+    RSI di Wilder sulla chiusura, periodo N.
+    Variazioni: change = close - prev close (dalla seconda candela).
+    Seed esplicito: media semplice dei primi N guadagni e delle prime N perdite
+    (disponibile dalla candela N+1), poi RMA: avg = (prev avg * (N - 1) + valore) / N.
+    RSI = 100 - 100 / (1 + avgGain / avgLoss); se avgLoss = 0: 100 (50 se anche avgGain = 0).
     """
 
     def __init__(self, period: int) -> None:
         self.period = period
-        self.alpha = 2.0 / (period + 1.0)
         self.value: Optional[float] = None
-        self._seed_sum = 0.0
+        self.avg_gain: Optional[float] = None
+        self.avg_loss: Optional[float] = None
+        self._prev_close: Optional[float] = None
+        self._gain_sum = 0.0
+        self._loss_sum = 0.0
         self._count = 0
 
-    def update(self, x: float) -> Optional[float]:
+    def update(self, close: float) -> Optional[float]:
+        if self._prev_close is None:
+            self._prev_close = close
+            return None
+        change = close - self._prev_close
+        self._prev_close = close
+        gain = change if change > 0.0 else 0.0
+        loss = -change if change < 0.0 else 0.0
         self._count += 1
-        if self.value is None:
-            self._seed_sum += x
+        if self.avg_gain is None:
+            self._gain_sum += gain
+            self._loss_sum += loss
             if self._count == self.period:
-                self.value = self._seed_sum / self.period
+                self.avg_gain = self._gain_sum / self.period
+                self.avg_loss = self._loss_sum / self.period
         else:
-            self.value = self.alpha * x + (1.0 - self.alpha) * self.value
+            self.avg_gain = (self.avg_gain * (self.period - 1) + gain) / self.period
+            self.avg_loss = (self.avg_loss * (self.period - 1) + loss) / self.period
+        if self.avg_gain is not None:
+            if self.avg_loss == 0.0:
+                self.value = 50.0 if self.avg_gain == 0.0 else 100.0
+            else:
+                self.value = 100.0 - 100.0 / (1.0 + self.avg_gain / self.avg_loss)
         return self.value
 
 
@@ -230,13 +250,13 @@ class IncrementalSupertrend:
 # ---------------------------------------------------------------------------
 # Funzioni pure condivise da backtest e live
 # ---------------------------------------------------------------------------
-def ema_trend(ema_fast: Optional[float], ema_slow: Optional[float]) -> Optional[str]:
-    """Trend dato dalle EMA: LONG se EMA veloce > lenta, SHORT se <, None se uguali o non disponibili."""
-    if ema_fast is None or ema_slow is None:
+def rsi_bias(rsi: Optional[float]) -> Optional[str]:
+    """Filtro RSI: LONG se RSI > RSI_THRESHOLD, SHORT se <, None se uguale o non disponibile."""
+    if rsi is None:
         return None
-    if ema_fast > ema_slow:
+    if rsi > RSI_THRESHOLD:
         return LONG
-    if ema_fast < ema_slow:
+    if rsi < RSI_THRESHOLD:
         return SHORT
     return None
 
@@ -244,23 +264,22 @@ def ema_trend(ema_fast: Optional[float], ema_slow: Optional[float]) -> Optional[
 def evaluate_trend_change(
     new_direction: int,
     st_line: float,
-    ema_fast: Optional[float],
-    ema_slow: Optional[float],
+    rsi: Optional[float],
     position: Optional[Position],
 ) -> Tuple[List[Action], str]:
     """
     Regole di apertura, valutate sulla candela di cambio di trend alla sua chiusura.
     - Con una posizione aperta il cambio è ignorato (non messo in coda).
-    - LONG: passaggio a isUpTrend con EMA veloce > lenta.
-    - SHORT: passaggio a isDownTrend con EMA veloce < lenta.
+    - LONG: passaggio a isUpTrend con RSI > RSI_THRESHOLD.
+    - SHORT: passaggio a isDownTrend con RSI < RSI_THRESHOLD.
     - SL = linea del Supertrend sulla candela di cambio, senza buffer.
     Restituisce (lista di Action, esito).
     """
     side = LONG if new_direction == IS_UP_TREND else SHORT
     if position is not None:
         return [], OUTCOME_IGNORED_POSITION
-    if ema_trend(ema_fast, ema_slow) != side:
-        return [], OUTCOME_REJECTED_EMA
+    if rsi_bias(rsi) != side:
+        return [], OUTCOME_REJECTED_FILTER
     return [Action(side=side, sl=st_line)], OUTCOME_ENTRY
 
 
@@ -275,7 +294,7 @@ def stop_distance_valid(side: str, entry: float, sl: float) -> bool:
 
 def size_position(equity: float, entry: float, sl: float, side: str) -> float:
     """
-    Quantità (in BTC) tale che, se lo SL viene colpito al suo livello, la perdita lorda
+    Quantità (in unità del sottostante) tale che, se lo SL viene colpito al suo livello, la perdita lorda
     sia RISK_PER_TRADE * equity. Calcolata sul prezzo di ingresso EFFETTIVO.
     Restituisce 0.0 se la distanza dallo SL è nulla o negativa (gap): trade da saltare.
     I costi (commissioni, slippage) non sono inclusi nel rischio.
@@ -297,18 +316,17 @@ def take_profit(side: str, entry: float, sl: float) -> float:
 # ---------------------------------------------------------------------------
 # Strategia
 # ---------------------------------------------------------------------------
-class SupertrendEmaStrategy:
+class SupertrendRsiStrategy:
     """
     Strategia a stato interno. Uso (identico in backtest e live):
-        strategy = SupertrendEmaStrategy()
+        strategy = SupertrendRsiStrategy()
         strategy.warmup(storico_candele_chiuse)            # almeno WARMUP_CANDLES candele
         actions = strategy.on_candle_close(candle, position)   # a ogni chiusura di candela
     """
 
     def __init__(self) -> None:
         self.supertrend = IncrementalSupertrend(ST_ATR_PERIOD, ST_MULTIPLIER)
-        self.ema_fast = IncrementalEMA(EMA_FAST)
-        self.ema_slow = IncrementalEMA(EMA_SLOW)
+        self.rsi = IncrementalRSI(RSI_PERIOD)
         self.candles_seen = 0
         self.last_time: Optional[datetime] = None
         # ultimo cambio di trend valutato (diagnostica); None finché non ce n'è uno
@@ -328,8 +346,7 @@ class SupertrendEmaStrategy:
             raise ValueError(f"Candele non in ordine cronologico: {candle.time} <= {self.last_time}")
         self.last_time = candle.time
         self.supertrend.update(candle.high, candle.low, candle.close)
-        self.ema_fast.update(candle.close)
-        self.ema_slow.update(candle.close)
+        self.rsi.update(candle.close)
         self.candles_seen += 1
 
     # -- interfaccia -------------------------------------------------------
@@ -355,16 +372,14 @@ class SupertrendEmaStrategy:
         actions, outcome = evaluate_trend_change(
             self.supertrend.direction,
             self.supertrend.value,
-            self.ema_fast.value,
-            self.ema_slow.value,
+            self.rsi.value,
             position,
         )
         self.last_signal = Signal(
             time=candle.time,
             direction=LONG if self.supertrend.direction == IS_UP_TREND else SHORT,
             st_line=self.supertrend.value,
-            ema_fast=self.ema_fast.value,
-            ema_slow=self.ema_slow.value,
+            rsi=self.rsi.value,
             outcome=outcome,
         )
         self.signal_on_last_candle = True
