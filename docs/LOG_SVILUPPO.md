@@ -78,3 +78,20 @@ Modifiche (solo `backtest.py` e test; **`strategy.py` invariato**, parametri inv
 Prova tecnica su un file sintetico in formato HistData con gli orari reali dell'oro (2023-2024):
 520 buchi, tutti classificati correttamente (416 pause giornaliere, 104 weekend). Anche qui i numeri
 di performance sono sintetici e privi di significato.
+
+## Aggiornamento: timeframe 2h e RR 3 (richiesta esplicita dell'utente)
+
+- `strategy.py`: nuovo parametro `TIMEFRAME_MINUTES = 120` (prima 15) e `RR = 3.0` (prima 2.0).
+  Gli altri parametri (ATR 10, moltiplicatore 3, EMA 50/100, rischio 1%, warm-up 500 candele) sono invariati.
+- Il timeframe sta in `strategy.py` perché fa parte della definizione della strategia: il backtest lo legge da lì
+  (`backtest.TF`) e un loop live deve usare lo stesso valore.
+- Candele 2h allineate a multipli di 2 ore dalla mezzanotte UTC (00:00, 02:00, ...). Con l'oro la candela che
+  contiene la pausa giornaliera risulta incompleta (alimentata comunque, marcata nel log).
+- Warm-up: 500 candele 2h ≈ 2 mesi di mercato; il periodo di trading si accorcia di conseguenza.
+- Con un timeframe più lento il numero di trade su 2023-2024 sarà verosimilmente inferiore a 200: in quel caso il
+  report segnala "campione insufficiente".
+- **Nota metodologica**: cambiare timeframe e RR è una nuova variante della strategia. Se la scelta è stata fatta
+  dopo aver visto i risultati della versione 15m/RR 2 sugli stessi dati, è una forma di ottimizzazione manuale e
+  i risultati della nuova versione vanno considerati in-sample; servono dati mai visti (es. 2025) per validarla.
+- Test aggiornati (TP calcolato con `st.RR`, dati sintetici più lunghi per il timeframe 2h): 14/14 superati.
+- Cartella non rinominata (`supertrend_ema_btc_15m`) per non rompere i percorsi già usati dall'utente.

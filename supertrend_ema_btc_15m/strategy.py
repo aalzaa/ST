@@ -1,11 +1,11 @@
 """
-Strategia Supertrend (entry) + filtro di trend EMA 50/100 su BTC, timeframe 15 minuti.
+Strategia Supertrend (entry) + filtro di trend EMA 50/100, timeframe TIMEFRAME_MINUTES (2 ore).
 
 Questo file contiene TUTTA e SOLO la logica di trading. È lo stesso identico codice
 usato dal backtest (backtest.py) e da un eventuale loop live:
 - non importa nulla del backtest;
 - non accede a file, rete, exchange, API o orologio di sistema;
-- riceve candele 15m CHIUSE, una alla volta, ed emette decisioni (Action);
+- riceve candele CHIUSE del timeframe, una alla volta, ed emette decisioni (Action);
 - calcola gli indicatori in modo incrementale con stato interno, quindi per
   costruzione non può vedere dati futuri.
 
@@ -23,13 +23,14 @@ from typing import Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Parametri (fissi, NON ottimizzati)
 # ---------------------------------------------------------------------------
+TIMEFRAME_MINUTES = 120  # timeframe delle candele passate alla strategia (2 ore)
 ST_ATR_PERIOD = 10        # periodo ATR (RMA di Wilder) del Supertrend
 ST_MULTIPLIER = 3.0       # moltiplicatore delle bande del Supertrend
 EMA_FAST = 50             # EMA veloce (filtro di trend)
 EMA_SLOW = 100            # EMA lenta (filtro di trend)
-RR = 2.0                  # rapporto rendimento/rischio del take profit
+RR = 3.0                  # rapporto rendimento/rischio del take profit
 RISK_PER_TRADE = 0.01     # frazione dell'equity rischiata per trade
-WARMUP_CANDLES = 500      # candele 15m senza segnali all'avvio (backtest e live)
+WARMUP_CANDLES = 500      # candele del timeframe senza segnali all'avvio (backtest e live)
 
 # ---------------------------------------------------------------------------
 # Costanti
@@ -52,7 +53,7 @@ OUTCOME_IGNORED_POSITION = "IGNORATO_POSIZIONE_APERTA"
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Candle:
-    """Candela 15m CHIUSA. `time` è l'orario di apertura della candela, in UTC."""
+    """Candela CHIUSA del timeframe (TIMEFRAME_MINUTES). `time` è l'orario di apertura della candela, in UTC."""
     time: datetime
     open: float
     high: float
@@ -301,7 +302,7 @@ class SupertrendEmaStrategy:
     Strategia a stato interno. Uso (identico in backtest e live):
         strategy = SupertrendEmaStrategy()
         strategy.warmup(storico_candele_chiuse)            # almeno WARMUP_CANDLES candele
-        actions = strategy.on_candle_close(candle, position)   # a ogni chiusura 15m
+        actions = strategy.on_candle_close(candle, position)   # a ogni chiusura di candela
     """
 
     def __init__(self) -> None:
@@ -340,7 +341,7 @@ class SupertrendEmaStrategy:
 
     def on_candle_close(self, candle: Candle, position: Optional[Position]) -> List[Action]:
         """
-        Da chiamare alla chiusura di ogni candela 15m.
+        Da chiamare alla chiusura di ogni candela del timeframe.
         Aggiorna SEMPRE indicatori e Supertrend; restituisce [] oppure [Action OPEN]
         da eseguire all'apertura della candela successiva. Con posizione aperta: sempre [].
         Durante le prime WARMUP_CANDLES candele non genera segnali.

@@ -1,4 +1,4 @@
-# ST — Strategia Supertrend + EMA su BTC
+# ST — Strategia Supertrend + EMA (timeframe 2h, RR 3)
 
 | Cartella / file | Contenuto |
 |---|---|

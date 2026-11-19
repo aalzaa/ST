@@ -1,8 +1,9 @@
 """
-Backtest della strategia definita in strategy.py (Supertrend + filtro EMA 50/100, timeframe 15m).
+Backtest della strategia definita in strategy.py (Supertrend + filtro EMA 50/100).
+Il timeframe è definito in strategy.py (TIMEFRAME_MINUTES).
 
 Questo file contiene tutto ciò che NON è logica di trading: caricamento e controllo dei
-dati 1m, aggregazione a 15m, replay candela per candela (come un loop live),
+dati 1m, aggregazione al timeframe della strategia, replay candela per candela (come un loop live),
 simulazione dell'esecuzione con costi, metriche, grafici, report e salvataggio.
 Le regole di trading stanno solo in strategy.py e qui vengono usate senza duplicarle.
 
@@ -64,6 +65,8 @@ KLINE_COLUMNS = [
 ]
 
 MINUTE_NS = 60 * 1_000_000_000
+TF = st.TIMEFRAME_MINUTES      # timeframe della strategia, in minuti
+TF_LABEL = f"{TF // 60}h" if TF % 60 == 0 else f"{TF}m"
 
 # Sessioni di ingresso in UTC (ore intere, [inizio, fine))
 SESSIONS = {
@@ -341,7 +344,7 @@ class DataReport:
     last_time: Optional[pd.Timestamp] = None
     rows_clean: int = 0
     has_2025: bool = False
-    candles_15m: int = 0
+    candles_tf: int = 0
     candles_incomplete: int = 0
     candles_missing: int = 0
 
@@ -475,7 +478,7 @@ def check_and_clean(df: pd.DataFrame, info: Dict) -> Tuple[pd.DataFrame, DataRep
     log.info("Buchi per tipo: %s; minuti mancanti per tipo: %s", rep.gaps_by_type, rep.missing_minutes_by_type)
     if rep.data_format == FORMAT_HISTDATA:
         log.info("Mercato non 24/7: chiusure del weekend e pausa giornaliera (17-18 New York) sono attese e non "
-                 "vengono riempite; le candele 15m interamente mancanti non sono alimentate alla strategia.")
+                 "vengono riempite; le candele interamente mancanti non sono alimentate alla strategia.")
     for start, end, n, kind in rep.gaps:
         log.info("  Buco: da %s a %s, %d minuti mancanti [%s]", start, end, n, kind)
     log.info("2025 presente nei dati: %s", "SÌ" if rep.has_2025 else "NO (il 2025 non è usato)")
@@ -483,11 +486,11 @@ def check_and_clean(df: pd.DataFrame, info: Dict) -> Tuple[pd.DataFrame, DataRep
 
 
 # ---------------------------------------------------------------------------
-# Aggregazione 15m
+# Aggregazione al timeframe della strategia
 # ---------------------------------------------------------------------------
 @dataclass
 class MarketData:
-    """Dati 1m (array numpy) e candele 15m con l'indice dei loro minuti."""
+    """Dati 1m (array numpy) e candele del timeframe con l'indice dei loro minuti."""
     m_time: np.ndarray
     m_open: np.ndarray
     m_high: np.ndarray
@@ -500,10 +503,11 @@ class MarketData:
     c_time_ns: np.ndarray
 
 
-def resample_15m(df: pd.DataFrame, rep: Optional[DataReport] = None) -> MarketData:
+def resample_candles(df: pd.DataFrame, rep: Optional[DataReport] = None) -> MarketData:
     """
-    Aggrega le 1m in candele 15m allineate a :00/:15/:30/:45 UTC con i soli minuti
-    disponibili. Le candele con meno di 15 minuti sono marcate incomplete; quelle
+    Aggrega le 1m in candele di TF minuti allineate a multipli di TF dalla mezzanotte UTC
+    (per 2h: 00:00, 02:00, ... UTC) con i soli minuti disponibili. Le candele con meno di
+    TF minuti sono marcate incomplete; quelle
     senza alcun minuto non esistono e non vengono alimentate alla strategia.
     """
     t = df["time_ns"].to_numpy(dtype="int64")
@@ -512,7 +516,7 @@ def resample_15m(df: pd.DataFrame, rep: Optional[DataReport] = None) -> MarketDa
     lo = df["low"].to_numpy(dtype="float64")
     c = df["close"].to_numpy(dtype="float64")
     v = df["volume"].to_numpy(dtype="float64")
-    bucket = t - (t % (15 * MINUTE_NS))
+    bucket = t - (t % (TF * MINUTE_NS))
     starts = np.concatenate(([0], np.nonzero(np.diff(bucket))[0] + 1))
     ends = np.concatenate((starts[1:], [len(t)]))
     c_open = o[starts]
@@ -528,12 +532,12 @@ def resample_15m(df: pd.DataFrame, rep: Optional[DataReport] = None) -> MarketDa
         for i in range(len(starts))
     ]
     if rep is not None:
-        rep.candles_15m = len(candles)
-        rep.candles_incomplete = int((minutes < 15).sum())
-        expected = int((c_time[-1] - c_time[0]) // (15 * MINUTE_NS) + 1)
+        rep.candles_tf = len(candles)
+        rep.candles_incomplete = int((minutes < TF).sum())
+        expected = int((c_time[-1] - c_time[0]) // (TF * MINUTE_NS) + 1)
         rep.candles_missing = expected - len(candles)
-        log.info("Candele 15m: %d (incomplete: %d; intere candele mancanti, non alimentate: %d)",
-                 rep.candles_15m, rep.candles_incomplete, rep.candles_missing)
+        log.info("Candele %s: %d (incomplete: %d; intere candele mancanti, non alimentate: %d)",
+                 TF_LABEL, rep.candles_tf, rep.candles_incomplete, rep.candles_missing)
     return MarketData(t, o, h, lo, c, candles, starts, ends, minutes, c_time)
 
 
@@ -567,7 +571,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
                initial_capital: float = INITIAL_CAPITAL, record_inputs: bool = False) -> ReplayResult:
     """
     Alimenta la strategia candela per candela come un loop live e simula l'esecuzione:
-    - ingresso all'open della prima 1m disponibile della candela 15m successiva, con slippage
+    - ingresso all'open della prima 1m disponibile della candela successiva, con slippage
       avverso e commissione taker;
     - SL/TP verificati sulle 1m a partire dalla 1m di ingresso inclusa; se la stessa 1m tocca
       entrambi si assume lo SL; se una 1m apre già oltre SL o TP (es. dopo un buco) il trade
@@ -711,7 +715,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
         if position is not None:
             sign = 1.0 if position.side == st.LONG else -1.0
             mtm += (m_close[e - 1] - position.entry) * position.qty * sign
-        eq_t[i - warm] = md.c_time_ns[i] + 15 * MINUTE_NS
+        eq_t[i - warm] = md.c_time_ns[i] + TF * MINUTE_NS
         eq_v[i - warm] = mtm
 
         # 4) decisione della strategia sulla candela chiusa
@@ -727,7 +731,7 @@ def run_replay(md: MarketData, commission: float = COMMISSION_RATE, slippage: fl
             sig = strategy.last_signal
             rec = {"time": pd.Timestamp(sig.time), "direction": sig.direction, "st_line": sig.st_line,
                    "ema_fast": sig.ema_fast, "ema_slow": sig.ema_slow, "outcome": sig.outcome,
-                   "execution": "", "candle_incomplete": bool(md.c_minutes[i] < 15)}
+                   "execution": "", "candle_incomplete": bool(md.c_minutes[i] < TF)}
             signals.append(rec)
             if sig.outcome == st.OUTCOME_IGNORED_POSITION and position is not None:
                 meta["ignored"] += 1
@@ -801,7 +805,7 @@ def compute_metrics(res: ReplayResult, initial_capital: float = INITIAL_CAPITAL)
     m["profitto_netto_usd"] = final_equity - initial_capital
     m["rendimento_pct"] = (final_equity / initial_capital - 1.0) * 100
     if len(eq) > 1:
-        start = eq.index[0] - pd.Timedelta(minutes=15)
+        start = eq.index[0] - pd.Timedelta(minutes=TF)
         years = (eq.index[-1] - start).total_seconds() / (365.25 * 86400)
     else:
         years = float("nan")
@@ -854,7 +858,7 @@ def compute_metrics(res: ReplayResult, initial_capital: float = INITIAL_CAPITAL)
         m["sharpe_annualizzato"] = float("nan")
         m["sortino_annualizzato"] = float("nan")
     if len(eq) > 1 and not tr.empty:
-        total_min = (eq.index[-1] - (eq.index[0] - pd.Timedelta(minutes=15))).total_seconds() / 60
+        total_min = (eq.index[-1] - (eq.index[0] - pd.Timedelta(minutes=TF))).total_seconds() / 60
         m["tempo_in_posizione_pct"] = float(tr["duration_min"].sum() / total_min * 100)
     else:
         m["tempo_in_posizione_pct"] = 0.0
@@ -922,7 +926,7 @@ def plot_equity(res: ReplayResult, path: str, symbol: str = "") -> None:
                                    gridspec_kw={"height_ratios": [3, 1.3]})
     ax1.plot(eq.index, eq.values, color=line, lw=1.6)
     ax1.axhline(INITIAL_CAPITAL, color=muted, lw=0.8, ls="--")
-    ax1.set_title("Equity (mark-to-market a ogni chiusura 15m, USD)", loc="left", color=ink, fontsize=11)
+    ax1.set_title(f"Equity (mark-to-market a ogni chiusura {TF_LABEL}, USD)", loc="left", color=ink, fontsize=11)
     ax2.fill_between(dd.index, dd.values, 0, color="#c2410c", alpha=0.35, lw=0)
     ax2.plot(dd.index, dd.values, color="#c2410c", lw=1.0)
     ax2.set_title("Drawdown (%)", loc="left", color=ink, fontsize=11)
@@ -933,7 +937,7 @@ def plot_equity(res: ReplayResult, path: str, symbol: str = "") -> None:
             ax.spines[sp].set_visible(False)
         for sp in ("left", "bottom"):
             ax.spines[sp].set_color(grid)
-    fig.suptitle(f"Supertrend + EMA 50/100 - {symbol} 15m", x=0.01, ha="left", color=ink, fontsize=13)
+    fig.suptitle(f"Supertrend + EMA 50/100 - {symbol} {TF_LABEL}", x=0.01, ha="left", color=ink, fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -1015,7 +1019,7 @@ def declarations(rep: DataReport) -> List[str]:
             "2. Gli orari dei file HistData sono in **EST fisso (UTC-5, senza ora legale)** e sono stati convertiti in "
             "UTC aggiungendo 5 ore.",
             "3. Il mercato **non è 24/7**: chiusura nel weekend e pausa giornaliera (17-18 ora di New York). I buchi non "
-            "sono stati riempiti: le candele 15m mancanti non sono alimentate alla strategia e i trade aperti durante "
+            "sono stati riempiti: le candele mancanti non sono alimentate alla strategia e i trade aperti durante "
             "una chiusura vengono verificati sulla prima 1m disponibile (uscita all'open se apre oltre SL o TP).",
             "4. Su un CFD XAUUSD gli short sono possibili; **swap/finanziamento overnight non inclusi**.",
             "5. Lo spread non è modellato esplicitamente (dati BID; gli acquisti in live avvengono all'ASK): lo slippage "
@@ -1040,7 +1044,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
                  bd: Dict[str, pd.DataFrame], notes: List[str]) -> None:
     tr = pd.DataFrame(res.trades)
     L: List[str] = []
-    L.append(f"# Report backtest - Supertrend + EMA 50/100 su {rep.symbol} 15m\n")
+    L.append(f"# Report backtest - Supertrend + EMA 50/100 su {rep.symbol} {TF_LABEL}\n")
     L.append("*Report generato automaticamente da `backtest.py`. Backtest eseguito una sola volta, parametri fissi, "
              "nessuna ottimizzazione.*\n")
     L.append("## Dichiarazioni obbligatorie\n")
@@ -1050,7 +1054,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
 
     L.append("## Strategia\n")
     L.append(f"- Supertrend ATR {st.ST_ATR_PERIOD} (RMA di Wilder), moltiplicatore {st.ST_MULTIPLIER}; filtro EMA "
-             f"{st.EMA_FAST}/{st.EMA_SLOW} sulla chiusura; seed SMA per ATR ed EMA; warm-up {st.WARMUP_CANDLES} candele 15m.")
+             f"{st.EMA_FAST}/{st.EMA_SLOW} sulla chiusura; seed SMA per ATR ed EMA; warm-up {st.WARMUP_CANDLES} candele {TF_LABEL}; timeframe {TF_LABEL} (candele allineate a multipli di {TF_LABEL} dalla mezzanotte UTC).")
     L.append("- LONG: Supertrend passa a rialzo e EMA50 > EMA100; SHORT: passa a ribasso e EMA50 < EMA100; "
              "valutato alla chiusura della candela di cambio, ingresso all'open della candela successiva.")
     L.append(f"- SL fisso sulla linea del Supertrend della candela di cambio; TP fisso a {st.RR:g}R dal prezzo di "
@@ -1065,7 +1069,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
     L.append(f"- Duplicati rimossi: {fmt(rep.exact_duplicates + rep.time_duplicates_conflicting)}; righe OHLC incoerenti: "
              f"{fmt(rep.ohlc_inconsistent_rows)}; prezzi non positivi: {fmt(rep.non_positive_rows)}; volume zero: "
              f"{fmt(rep.zero_volume_rows)}; sovrapposizioni tra mesi: {fmt(len(rep.month_overlaps))}")
-    L.append(f"- Candele 15m: {fmt(rep.candles_15m)} (incomplete: {fmt(rep.candles_incomplete)}; intere candele mancanti: "
+    L.append(f"- Candele {TF_LABEL}: {fmt(rep.candles_tf)} (incomplete: {fmt(rep.candles_incomplete)}; intere candele mancanti: "
              f"{fmt(rep.candles_missing)})")
     L.append(f"- Buchi per tipo: {rep.gaps_by_type}; minuti mancanti per tipo: {rep.missing_minutes_by_type}")
     big = [g for g in rep.gaps if g[2] > LARGE_GAP_MINUTES]
@@ -1165,7 +1169,7 @@ def write_report(path: str, rep: DataReport, files: List[str], m: Dict, m2: Dict
 # Main
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Backtest Supertrend + EMA 50/100, timeframe 15m")
+    p = argparse.ArgumentParser(description=f"Backtest Supertrend + EMA 50/100, timeframe {TF_LABEL}")
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="cartella dei dati 1m (HistData o Binance)")
     p.add_argument("--name", default=DEFAULT_NAME, help="nome del file unico (senza estensione)")
     p.add_argument("--out", default=DEFAULT_OUT, help="cartella di output")
@@ -1175,17 +1179,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     log_path = setup_logging(args.out)
-    log.info("=== BACKTEST Supertrend + EMA 50/100 (15m) ===")
+    log.info("=== BACKTEST Supertrend + EMA 50/100 (%s) ===", TF_LABEL)
     log.info("Parametri strategia (fissi): ATR=%d, mult=%.1f, EMA=%d/%d, RR=%.1f, rischio=%.2f%%, warm-up=%d",
              st.ST_ATR_PERIOD, st.ST_MULTIPLIER, st.EMA_FAST, st.EMA_SLOW, st.RR, st.RISK_PER_TRADE * 100,
              st.WARMUP_CANDLES)
     log.info("Esecuzione: capitale %.0f, commissione %.3f%%/lato, slippage %.3f%%/lato, funding/swap non inclusi",
              INITIAL_CAPITAL, COMMISSION_RATE * 100, SLIPPAGE_RATE * 100)
-    log.info("Assunzioni: ingresso all'open della prima 1m disponibile della candela 15m successiva; SL/TP su 1m dalla "
+    log.info("Assunzioni: ingresso all'open della prima 1m disponibile della candela successiva; SL/TP su 1m dalla "
              "1m di ingresso inclusa; SL e TP toccati nella stessa 1m => SL; 1m che apre oltre SL/TP (es. dopo un buco) "
              "=> uscita all'open; slippage avverso applicato a ingresso, SL, TP e chiusura fine dati; commissione taker "
              "su entrambi i lati; sizing sull'equity realizzata al momento dell'ingresso, costi esclusi dal rischio; "
-             "candele 15m incomplete alimentate normalmente; candele 15m interamente mancanti non alimentate.")
+             f"candele {TF_LABEL} incomplete alimentate normalmente; candele {TF_LABEL} interamente mancanti non alimentate.")
     log.info("Sessioni (UTC, ora di ingresso): Asia 21:00-07:59, Londra 08:00-12:59, NY 13:00-20:59")
 
     files = find_data_files(args.data_dir, args.name)
@@ -1193,10 +1197,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     for f in info["files"]:
         log.info("Letto %s: %d righe, %d colonne", f["file"], f["rows"], f["columns"])
     df, rep = check_and_clean(raw, info)
-    md = resample_15m(df, rep)
+    md = resample_candles(df, rep)
     if len(md.candles) <= st.WARMUP_CANDLES:
-        raise SystemExit("Dati insufficienti: servono più di WARMUP_CANDLES candele 15m")
-    log.info("Warm-up: prime %d candele 15m (fino a %s) senza segnali", st.WARMUP_CANDLES,
+        raise SystemExit("Dati insufficienti: servono più di WARMUP_CANDLES candele")
+    log.info("Warm-up: prime %d candele %s (fino a %s) senza segnali", st.WARMUP_CANDLES, TF_LABEL,
              md.candles[st.WARMUP_CANDLES - 1].time)
 
     log.info("=== REPLAY (costi base) ===")

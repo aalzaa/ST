@@ -45,13 +45,13 @@ def synthetic_minutes(days: int = 60, seed: int = 7, start: str = "2023-01-01") 
 
 
 def synthetic_candles(n: int = 3000, seed: int = 3):
-    """Candele 15m sintetiche (oggetti Candle)."""
-    md = bt.resample_15m(synthetic_minutes(days=max(10, n // 96 + 1), seed=seed))
+    """Candele sintetiche del timeframe della strategia (oggetti Candle)."""
+    md = bt.resample_candles(synthetic_minutes(days=n * bt.TF // 1440 + 5, seed=seed))
     return md.candles[:n]
 
 
 def make_candle(i: int, o: float, h: float, l: float, c: float) -> st.Candle:
-    t = datetime(2023, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=15 * i)
+    t = datetime(2023, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=bt.TF * i)
     return st.Candle(time=t, open=o, high=h, low=l, close=c, volume=1.0)
 
 
@@ -108,10 +108,10 @@ def reference_indicators(high, low, close, atr_period=10, mult=3.0, fast=50, slo
 _MD_CACHE = {}
 
 
-def market(days=60, seed=7):
+def market(days=400, seed=7):
     key = (days, seed)
     if key not in _MD_CACHE:
-        _MD_CACHE[key] = bt.resample_15m(synthetic_minutes(days=days, seed=seed))
+        _MD_CACHE[key] = bt.resample_candles(synthetic_minutes(days=days, seed=seed))
     return _MD_CACHE[key]
 
 
@@ -180,9 +180,9 @@ def test_no_lookahead():
         assert acts == res.actions_out[N], f"azioni diverse alla candela {N}: {acts} vs {res.actions_out[N]}"
 
     # troncando i dati 1m a metà, i trade chiusi prima del taglio sono identici
-    df = synthetic_minutes()
+    df = synthetic_minutes(days=400)
     cut = df["time_ns"].iloc[len(df) // 2]
-    md_half = bt.resample_15m(df[df["time_ns"] < cut].reset_index(drop=True))
+    md_half = bt.resample_candles(df[df["time_ns"] < cut].reset_index(drop=True))
     res_half = bt.run_replay(md_half)
     full = [t for t in res.trades if t["exit_reason"] != "fine_dati" and t["exit_time"].value < cut]
     half = [t for t in res_half.trades if t["exit_reason"] != "fine_dati"]
@@ -325,9 +325,9 @@ def test_sizing_and_tp():
     assert st.size_position(10000, 101.0, 100.0, st.SHORT) == 0.0
     q = st.size_position(10000, 100.0, 98.0, st.LONG)
     assert abs(q * 2.0 - 100.0) < 1e-9
-    assert abs(st.take_profit(st.LONG, 100.0, 98.0) - 104.0) < 1e-12
-    assert abs(st.take_profit(st.SHORT, 100.0, 102.0) - 96.0) < 1e-12
-    return "sizing 1% e TP 2R corretti, distanza SL <= 0 => 0"
+    assert abs(st.take_profit(st.LONG, 100.0, 98.0) - (100.0 + 2.0 * st.RR)) < 1e-12
+    assert abs(st.take_profit(st.SHORT, 100.0, 102.0) - (100.0 - 2.0 * st.RR)) < 1e-12
+    return "sizing 1% e TP a RR corretti, distanza SL <= 0 => 0"
 
 
 def test_out_of_order_rejected():
@@ -349,14 +349,14 @@ def _first_long_trade(res, min_minutes=40):
 
 
 def test_execution_sl_and_tp_same_minute():
-    df = synthetic_minutes()
-    res = bt.run_replay(bt.resample_15m(df))
+    df = synthetic_minutes(days=400)
+    res = bt.run_replay(bt.resample_candles(df))
     t = _first_long_trade(res)
     k = int(np.nonzero(df["time_ns"].to_numpy() == t["entry_time"].value)[0][0]) + 1
     df2 = df.copy()
     df2.loc[k, "high"] = t["tp"] * 1.01
     df2.loc[k, "low"] = t["sl"] * 0.99
-    res2 = bt.run_replay(bt.resample_15m(df2))
+    res2 = bt.run_replay(bt.resample_candles(df2))
     t2 = [x for x in res2.trades if x["entry_time"] == t["entry_time"]][0]
     assert t2["exit_reason"] == "SL" and t2["exit_time"].value == df["time_ns"].iloc[k]
     assert abs(t2["exit_price"] - t["sl"] * (1 - bt.SLIPPAGE_RATE)) < 1e-6
@@ -364,8 +364,8 @@ def test_execution_sl_and_tp_same_minute():
 
 
 def test_execution_gap_exit_at_open():
-    df = synthetic_minutes()
-    res = bt.run_replay(bt.resample_15m(df))
+    df = synthetic_minutes(days=400)
+    res = bt.run_replay(bt.resample_candles(df))
     t = _first_long_trade(res)
     k = int(np.nonzero(df["time_ns"].to_numpy() == t["entry_time"].value)[0][0])
     drop = list(range(k + 1, k + 31))   # buco di 30 minuti subito dopo l'ingresso
@@ -375,7 +375,7 @@ def test_execution_gap_exit_at_open():
     for col in ("open", "high", "low", "close"):
         df2.loc[after, col] = gap_price
     df2 = df2.drop(index=drop).reset_index(drop=True)
-    res2 = bt.run_replay(bt.resample_15m(df2))
+    res2 = bt.run_replay(bt.resample_candles(df2))
     t2 = [x for x in res2.trades if x["entry_time"] == t["entry_time"]][0]
     assert t2["exit_reason"] == "SL" and t2["exit_at_open_beyond_level"] and t2["gap_during_trade"]
     assert abs(t2["exit_price"] - gap_price * (1 - bt.SLIPPAGE_RATE)) < 1e-6, "uscita non all'open dopo il buco"
@@ -392,11 +392,11 @@ def test_data_checks_and_resample():
     raw = raw.iloc[::-1].reset_index(drop=True)
     clean, rep = bt.check_and_clean(raw, {"header_rows": 0, "unit_counts": {}})
     assert rep.exact_duplicates == 1 and not rep.was_sorted and rep.missing_minutes == 3 and len(rep.gaps) == 1
-    md = bt.resample_15m(clean)
-    assert all(pd.Timestamp(c.time).minute % 15 == 0 for c in md.candles)
-    assert int((md.c_minutes < 15).sum()) == 1
+    md = bt.resample_candles(clean)
+    assert all(pd.Timestamp(c.time).value % (bt.TF * bt.MINUTE_NS) == 0 for c in md.candles)
+    assert int((md.c_minutes < bt.TF).sum()) == 1
     c0 = md.candles[0]
-    first15 = df.iloc[:15]
+    first15 = df.iloc[:bt.TF].drop(index=range(100, 103))
     assert c0.open == first15["open"].iloc[0] and c0.close == first15["close"].iloc[-1]
     assert c0.high == first15["high"].max() and c0.low == first15["low"].min()
     # limite temporale
@@ -407,7 +407,7 @@ def test_data_checks_and_resample():
         raise AssertionError("dati oltre il 2025 accettati")
     except SystemExit:
         pass
-    return "duplicati, ordinamento, buchi, aggregazione 15m e limite 2025 verificati"
+    return "duplicati, ordinamento, buchi, aggregazione al timeframe e limite 2025 verificati"
 
 
 def test_histdata_format_and_gaps():

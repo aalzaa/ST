@@ -1,8 +1,9 @@
-# Supertrend + EMA 50/100 — 15m (dati attuali: XAUUSD)
+# Supertrend + EMA 50/100 — timeframe 2h, RR 3 (dati attuali: XAUUSD)
 
-Strategia (timeframe 15 minuti), nata per BTC e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
+Strategia (timeframe **2 ore**, `TIMEFRAME_MINUTES = 120` in `strategy.py`), nata per BTC 15m e ora testata su XAUUSD, con ingresso sul cambio di trend del Supertrend
 (ATR 10, moltiplicatore 3) e filtro di trend EMA 50/100. Uscite solo per stop loss
-(linea del Supertrend sulla candela di cambio, fisso) o take profit (2R, fisso).
+(linea del Supertrend sulla candela di cambio, fisso) o take profit (**3R**, fisso).
+Nota: la cartella mantiene il nome storico `supertrend_ema_btc_15m` per non rompere i percorsi.
 Parametri fissi, nessuna ottimizzazione.
 
 ## Struttura dei file
@@ -10,7 +11,7 @@ Parametri fissi, nessuna ottimizzazione.
 ```
 supertrend_ema_btc_15m/
 ├── strategy.py        # TUTTA la strategia e nient'altro (identica in backtest e live)
-├── backtest.py        # dati, controlli, resample 15m, replay, esecuzione simulata, metriche, report
+├── backtest.py        # dati, controlli, resample al timeframe, replay, esecuzione simulata, metriche, report
 ├── test_strategy.py   # test (python test_strategy.py, senza pytest)
 ├── requirements.txt
 ├── README.md
@@ -30,7 +31,7 @@ supertrend_ema_btc_15m/
 ### Separazione strategia / backtest
 
 - `strategy.py` non importa nulla del backtest e non accede a file, rete, exchange, API o orologio.
-  Riceve candele 15m **chiuse**, una alla volta, e calcola gli indicatori in modo **incrementale**
+  Riceve candele **chiuse** del timeframe, una alla volta, e calcola gli indicatori in modo **incrementale**
   (stato interno, nessun ricalcolo sulla storia): per costruzione non vede il futuro.
 - Interfaccia: `Candle`, `Position` (o `None` se flat), `Action` (solo `OPEN`), `warmup(candles)`,
   `on_candle_close(candle, position)`, `last_signal` (diagnostica), `size_position(...)`,
@@ -56,7 +57,7 @@ Formati riconosciuti automaticamente dal contenuto:
 
 Per XAUUSD il mercato non è 24/7: chiusure del weekend e pausa giornaliera (17-18 ora di New York)
 sono riconosciute e classificate nel log e in `data_gaps.csv` (colonna `tipo`), non vengono
-riempite e le candele 15m mancanti non vengono passate alla strategia. Un trade aperto durante
+riempite e le candele mancanti non vengono passate alla strategia. Un trade aperto durante
 una chiusura viene verificato sulla prima 1m disponibile (uscita all'open se apre oltre SL o TP).
 
 I dati oltre il 31/12/2025 fanno interrompere il backtest con errore.
@@ -105,13 +106,13 @@ import strategy as st
 
 strat = st.SupertrendEmaStrategy()
 
-# 1) warm-up: almeno le ultime WARMUP_CANDLES (500) candele 15m CHIUSE, dalla più vecchia
-history = exchange.fetch_closed_15m_candles(limit=1000)        # Candle(time UTC, o, h, l, c, v)
+# 1) warm-up: almeno le ultime WARMUP_CANDLES (500) candele 2h CHIUSE, dalla più vecchia
+history = exchange.fetch_closed_candles(timeframe="2h", limit=1000)        # Candle(time UTC, o, h, l, c, v)
 strat.warmup(history)                                          # nessun segnale qui
 
-# 2) a ogni chiusura di candela 15m (solo candele chiuse, mai quella in formazione)
+# 2) a ogni chiusura di candela 2h (solo candele chiuse, mai quella in formazione)
 while True:
-    candle = wait_for_next_closed_15m_candle()                 # Candle chiusa
+    candle = wait_for_next_closed_2h_candle()                 # Candle chiusa
     position = exchange.current_position()                     # Position(...) oppure None
     actions = strat.on_candle_close(candle, position)          # aggiorna SEMPRE gli indicatori
 
@@ -130,7 +131,8 @@ while True:
 
 Note per il live:
 - se il loop riparte, rifare il warm-up con lo storico prima di operare;
-- una candela 15m mancante (exchange fermo) non va inventata: semplicemente non viene passata;
+- le candele 2h vanno allineate come nel backtest (00:00, 02:00, ... UTC);
+- una candela mancante (exchange fermo) non va inventata: semplicemente non viene passata;
 - la quantità in pratica va calcolata prima dell'ordine (su un prezzo stimato) e poi verificata
   sul fill; il TP va ricalcolato sul prezzo effettivo con `take_profit`.
 
