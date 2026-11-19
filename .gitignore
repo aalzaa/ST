@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# dati grezzi: non versionare
+*.zip
+*.parquet
+BTCUSDT*.csv
